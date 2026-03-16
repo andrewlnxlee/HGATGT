@@ -112,6 +112,10 @@ class GNNGroupTracker(nn.Module):
     def forward(self, data):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
         
+        expected_edge_dim = self.edge_encoder[0].in_features
+        if edge_attr.shape[0] == 0 and edge_attr.shape[1] != expected_edge_dim:
+            edge_attr = torch.empty((0, expected_edge_dim), dtype=x.dtype, device=x.device)
+            
         # --- 1. Enhanced Encoding ---
         # 仅对坐标部分 [x, y] 进行傅里叶编码
         x_pos = x[:, :2]

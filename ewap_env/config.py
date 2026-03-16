@@ -18,8 +18,6 @@ HIDDEN_DIM = 64
 BATCH_SIZE = 1    # 图网络建议 Batch=1 (指一次处理一个时序图序列) 或使用 PyG Batch
 LEARNING_RATE = 0.001
 EPOCHS = 50
-MODEL_SAVE_PATH = "sim_env/model/best_model_v5.pth"
-MODEL_USE_PATH = "sim_env/model/best_model_v4.pth"
 DEVICE = "cuda"   # 或 "cpu"
 
 # --- 输出配置 ---
