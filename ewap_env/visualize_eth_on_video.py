@@ -22,8 +22,6 @@ import config
 from model import GNNGroupTracker
 from trackers.gnn_processor import GNNPostProcessor
 
-version = "v4"
-
 # --- 坐标转换与校准 ---
 def world_to_pixel(x, y, H_inv, u_offset=50, v_offset=-50):
     point = np.array([y, x, 1.0]).reshape(3, 1) 
@@ -50,9 +48,10 @@ def visualize_on_video():
     h_matrix_path = "datasets/ewap_dataset/seq_eth/H.txt"
     obsmat_path = "datasets/ewap_dataset/seq_eth/obsmat.txt"
     # 加载从头训练的模型
-    model_path = "best_model_eth_scratch.pth"
+    model_path = config.EWAP_MODEL_USE_PATH
+    save_path = os.path.join(config.OUTPUT_MP4_DIR, "eth_v1.mp4")
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
-
+    
     H = np.loadtxt(h_matrix_path)
     H_inv = np.linalg.inv(H)
     obs_data = parse_obsmat(obsmat_path)
@@ -60,12 +59,8 @@ def visualize_on_video():
 
     gnn_model = GNNGroupTracker().to(device)
     if os.path.exists(model_path):
-        print(f"✅ 加载模型权重: {model_path}")
         gnn_model.load_state_dict(torch.load(model_path, map_location=device))
-    else:
-        print(f"⚠️ 未找到模型权重文件: {model_path}，将使用随机初始化权重（仅用于结构验证）")
-    
-    gnn_model.eval()
+        gnn_model.eval()
 
     tracker = GNNPostProcessor()
 
@@ -75,10 +70,10 @@ def visualize_on_video():
         print(f"❌ 无法读取视频: {e}")
         return
 
-    path2 = os.path.join(config.OUTPUT_MP4_DIR, f"eth_final_{version}.mp4")
-    # 使用 10fps，确保动作连贯
-    writer = imageio.get_writer(path2, fps=10, quality=9, codec='libx264')
     
+    # 使用 10fps，确保动作连贯
+    writer = imageio.get_writer(save_path, fps=10, quality=9, codec='libx264')
+    print("保存视频到: ", save_path)
     history = {} 
     colors = {} 
     

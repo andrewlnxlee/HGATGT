@@ -67,7 +67,11 @@ def evaluate_scene(scene_name, scene_folder, gnn_model, device):
             # 2. 构造独立的测量点 Meas (注入 3.0 强度的噪声)
             # 加大噪声，进一步考验各算法的滤波和状态估计能力
             raw_x = graph.x.numpy().copy()
-            noise = np.random.normal(0, 3.0, raw_x.shape)
+            noise = np.zeros_like(raw_x)
+            noise[:,:2] = np.random.normal(0, 3.0, (len(raw_x), 2))
+            if raw_x.shape[1] >= 4:
+                # 适当注入速度噪声
+                noise[:,2:4] = np.random.normal(0, 0.5, (len(raw_x), 2))
             meas_points = raw_x + noise
 
             # ========================
@@ -77,14 +81,29 @@ def evaluate_scene(scene_name, scene_folder, gnn_model, device):
             if gnn_model:
                 graph_dev = graph.to(device)
                 # 注意：为了公平，GNN 的输入也必须是带噪声的 meas_points
-                # 我们临时替换 graph 的数据
+                # 我们临时替换 graph 的数据，并同步更新 edge_attr
                 graph_dev.x = torch.from_numpy(meas_points).float().to(device)
+                
+                src, dst = graph_dev.edge_index
+                if len(src) > 0:
+                    pos_src, pos_dst = graph_dev.x[src, :2], graph_dev.x[dst, :2]
+                    rel_pos = pos_dst - pos_src
+                    dist = torch.norm(rel_pos, dim=1, keepdim=True)
+                    if config.INPUT_DIM >= 4 and config.EDGE_DIM >= 6:
+                        v_src, v_dst = graph_dev.x[src, 2:4], graph_dev.x[dst, 2:4]
+                        rel_v = v_dst - v_src
+                        v1_n = torch.norm(v_src, dim=1, keepdim=True) + 1e-6
+                        v2_n = torch.norm(v_dst, dim=1, keepdim=True) + 1e-6
+                        cos_sim = torch.sum(v_src * v_dst, dim=1, keepdim=True) / (v1_n * v2_n)
+                        graph_dev.edge_attr = torch.cat([rel_pos, dist, rel_v, cos_sim], dim=1)
+                    else:
+                        graph_dev.edge_attr = torch.cat([rel_pos, dist], dim=1)
+
                 with torch.no_grad():
                     _, offsets, _, h_final = gnn_model(graph_dev)
                 
-                # 彻底关闭 GNN 的 offsets 纠偏，因为未经过抗噪训练的 offsets 会放大噪声
                 # 我们现在纯靠 GNN 提取的高维特征来进行数据关联 (证明我们的特征比纯距离强)
-                corrected = meas_points.copy()
+                corrected = meas_points[:, :2].copy()
                 
                 node_features = h_final.cpu().numpy() if h_final is not None else None
                 # 使用 pre_gnn 逻辑，不传递 node_features 作为 shape
@@ -101,7 +120,8 @@ def evaluate_scene(scene_name, scene_folder, gnn_model, device):
             # Social-STGCNN (基线：不具备纠偏能力)
             # ========================
             t0 = time.time()
-            sc, sid, smap = trackers['Social-STGCNN'].step(meas_points)
+            meas_points_2d = meas_points[:, :2]
+            sc, sid, smap = trackers['Social-STGCNN'].step(meas_points_2d)
             metrics['Social-STGCNN'].update_time(time.time() - t0)
             # 这里 sc 里的点就是 meas_points 里的点，所以误差应该是 ~8.0
             metrics['Social-STGCNN'].update(gt_centers, gt_ids, sc, sid)
@@ -113,17 +133,17 @@ def evaluate_scene(scene_name, scene_folder, gnn_model, device):
             # 预处理
             t_pre = time.time()
             base_dets, base_map = [], {}
-            if len(meas_points) > 0:
-                dbl = DBSCAN(eps=35, min_samples=1).fit_predict(meas_points)
+            if len(meas_points_2d) > 0:
+                dbl = DBSCAN(eps=35, min_samples=1).fit_predict(meas_points_2d)
                 for i, l in enumerate([l for l in set(dbl) if l != -1]):
                     idx = np.where(dbl == l)[0]
-                    base_dets.append(np.mean(meas_points[idx], axis=0))
+                    base_dets.append(np.mean(meas_points_2d[idx], axis=0))
                     base_map[i] = idx
             pre_time = time.time() - t_pre
 
             # Baseline
             t0 = time.time()
-            bc, bid, bmap = trackers['Baseline'].step(meas_points)
+            bc, bid, bmap = trackers['Baseline'].step(meas_points_2d)
             metrics['Baseline'].update(gt_centers, gt_ids, bc, bid)
             metrics['Baseline'].update_clustering_metrics(pt_lbl, bmap)
 
@@ -139,7 +159,7 @@ def evaluate_scene(scene_name, scene_folder, gnn_model, device):
             
             # Graph-MB
             t0 = time.time()
-            gmb_c, gmb_id, gmb_lbl = trackers['Graph-MB'].step(meas_points)
+            gmb_c, gmb_id, gmb_lbl = trackers['Graph-MB'].step(meas_points_2d)
             metrics['Graph-MB'].update(gt_centers, gt_ids, gmb_c, gmb_id)
             metrics['Graph-MB'].update_clustering_metrics(pt_lbl, gmb_lbl)
 

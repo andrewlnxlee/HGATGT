@@ -75,7 +75,9 @@ def generate_training_data(scene_name, ped_to_group, split='train'):
         pid = int(row[1])
         x = row[2]
         y = row[4]
-        frames_data[fid].append((pid, x, y))
+        vx = row[5]
+        vy = row[7]
+        frames_data[fid].append((pid, x, y, vx, vy))
         
     sorted_frames = sorted(frames_data.keys())
     all_frame_dicts = []
@@ -86,11 +88,11 @@ def generate_training_data(scene_name, ped_to_group, split='train'):
         
         meas_list = []
         label_list = []
-        for pid, x, y in peds:
+        for pid, x, y, vx, vy in peds:
             # 同样使用 config 中的统一缩放
             scaled_x = x * config.COORD_SCALE + config.COORD_OFFSET[0]
             scaled_y = y * config.COORD_SCALE + config.COORD_OFFSET[1]
-            meas_list.append([scaled_x, scaled_y])
+            meas_list.append([scaled_x, scaled_y, vx, vy])
             label_list.append(ped_to_group[pid])
             
         meas = np.array(meas_list)

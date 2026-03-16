@@ -37,7 +37,9 @@ def parse_obsmat(filepath):
         ped_id = int(row[1])
         x = row[2]   # pos_x
         y = row[4]   # pos_y (跳过 pos_z)
-        frames[frame_id].append((ped_id, x, y))
+        vx = row[5]  # v_x
+        vy = row[7]  # v_y
+        frames[frame_id].append((ped_id, x, y, vx, vy))
     return frames
 
 
@@ -82,8 +84,8 @@ def convert_scene(scene_name, output_name):
     # 为不在群组中的行人分配独立 group_id
     all_ped_ids = set()
     for peds in frames_data.values():
-        for pid, _, _ in peds:
-            all_ped_ids.add(pid)
+        for item in peds:
+            all_ped_ids.add(item[0])
     
     max_group_id = max(ped_to_group.values()) if ped_to_group else 0
     next_group_id = max_group_id + 1
@@ -112,11 +114,18 @@ def convert_scene(scene_name, output_name):
         meas_list = []
         label_list = []
         
-        for pid, x, y in peds:
+        import config
+        for pid, x, y, vx, vy in peds:
             # 坐标缩放 + 偏移
             scaled_x = x * COORD_SCALE + COORD_OFFSET[0]
             scaled_y = y * COORD_SCALE + COORD_OFFSET[1]
-            meas_list.append([scaled_x, scaled_y])
+            # 速度缩放：ETH 数据集 FPS 为 2.5，所以每帧间隔 dt = 0.4s
+            scaled_vx = vx * 0.4 * COORD_SCALE
+            scaled_vy = vy * 0.4 * COORD_SCALE
+            if config.INPUT_DIM == 4:
+                meas_list.append([scaled_x, scaled_y, scaled_vx, scaled_vy])
+            else:
+                meas_list.append([scaled_x, scaled_y])
             label_list.append(ped_to_group[pid])
         
         meas = np.array(meas_list)
