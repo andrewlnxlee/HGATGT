@@ -10,7 +10,9 @@ FRAMES_PER_SAMPLE = 50    # 每个样本包含多少帧 (短片段利于训练)
 MAX_GROUPS = 5            # 场景中最大群数量
 
 # --- 模型配置 ---
-INPUT_DIM = 2     # x, y
+# INPUT_DIM = 4     # x, y, vx, vy
+# EDGE_DIM = 6      # dx, dy, dist, dvx, dvy, cos_sim
+INPUT_DIM = 2     # x, y 原先
 EDGE_DIM = 3      # dx, dy, dist
 HIDDEN_DIM = 64
 
@@ -22,6 +24,21 @@ MODEL_SAVE_PATH = "sim_env/model/best_model_v5.pth"
 MODEL_USE_PATH = "sim_env/model/best_model_v4.pth"
 DEVICE = "cuda"   # 或 "cpu"
 
-# --- 输出配置
+# --- 输出配置 ---
 OUTPUT_TEST_DIR = "sim_env/output/test"
 OUTPUT_GIF_DIR = "sim_env/output/track_result_gif"
+
+
+# ---------------------- EWAP数据集 ---------------------- 
+# -------------------------------------------------------
+
+# --- 模型配置 ---
+EWAP_MODEL_SAVE_PATH = "ewap_env/model/best_model_v5.pth"
+EWAP_MODEL_USE_PATH = "ewap_env/model/best_model_v4.pth"
+
+# --- 坐标转换 (用于 ETH/Hotel 数据集) ---
+COORD_SCALE = 50.0       # 缩放倍数
+COORD_OFFSET = [500.0, 500.0]  # 中心偏移 (x, y)
+
+# --- 输出配置 ---
+OUTPUT_MP4_DIR = "ewap_env/output/track_result_mp4"
