@@ -19,8 +19,8 @@ from model import GNNGroupTracker
 from trackers.baseline import BaselineTracker
 from trackers.cbmember import CBMeMBerTracker
 from trackers.gm_cphd import GMCPHDTracker
+from trackers.gnn_processor import GNNPostProcessor
 from trackers.gnn_processor_single import (
-    GNNPointPostProcessor,
     POINT_TRACK_MAX_AGE as DEFAULT_POINT_TRACK_MAX_AGE,
     POINT_TRACK_RECOVERY_THRESHOLD as DEFAULT_POINT_TRACK_RECOVERY_THRESHOLD,
     POINT_TRACK_STAGE1_THRESHOLD as DEFAULT_POINT_TRACK_STAGE1_THRESHOLD,
@@ -289,6 +289,41 @@ def filter_clustered_points(points, eps=POINT_CLUSTER_EPS, min_samples=POINT_CLU
     return filtered_points, keep_mask, labels
 
 
+def build_group_detections(points, eps=POINT_CLUSTER_EPS, min_samples=POINT_CLUSTER_MIN_SAMPLES):
+    cluster_labels, det_centers, centroid_to_points = cluster_measurements(points, eps=eps, min_samples=min_samples)
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    det_shapes = []
+    valid_labels = sorted(l for l in np.unique(cluster_labels) if l != -1)
+    for label in valid_labels:
+        indices = np.where(cluster_labels == label)[0]
+        pts = points[indices]
+        if len(pts) > 1:
+            lower = np.percentile(pts, 5, axis=0)
+            upper = np.percentile(pts, 95, axis=0)
+            wh = upper - lower
+        else:
+            wh = np.array([0.0, 0.0])
+        det_shapes.append(np.maximum(wh, 3.0))
+
+    det_shapes = np.asarray(det_shapes, dtype=float).reshape(-1, 2)
+    if len(det_shapes) == 0:
+        det_shapes = None
+    return cluster_labels, det_centers, centroid_to_points, det_shapes
+
+
+def run_hgat_point_identity_pipeline(points, group_tracker, point_assoc):
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    cluster_labels, det_centers, _, det_shapes = build_group_detections(points)
+    if len(det_centers) > 0:
+        pred_group_centers, pred_group_ids, _ = group_tracker.update(det_centers, det_shapes)
+    else:
+        pred_group_centers, pred_group_ids, _ = group_tracker.update(np.empty((0, 2)), None)
+
+    point_group_ids = project_cluster_tracks_to_points(points, cluster_labels, pred_group_centers, pred_group_ids)
+    pred_points, pred_ids = point_assoc.update(points, point_group_ids)
+    return pred_points, pred_ids
+
+
 def run_evaluation():
     device = torch.device(config.DEVICE)
     print(f"Loading Test Data from {config.DATA_ROOT}...")
@@ -330,26 +365,17 @@ def run_evaluation():
     for episode_idx in tqdm(range(len(test_set))):
         episode_graphs = test_set.get(episode_idx)
 
-        gnn_processor = GNNPointPostProcessor(
-            max_age=POINT_TRACK_MAX_AGE,
-            stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
-            stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
-        )
-        gnn_meas_processor = GNNPointPostProcessor(
-            max_age=POINT_TRACK_MAX_AGE,
-            stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
-            stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
-        ) if enable_meas_diagnostic else None
-        gnn_no_gate_processor = GNNPointPostProcessor(
-            max_age=POINT_TRACK_MAX_AGE,
-            stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
-            stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
-        ) if enable_uncertainty_ablation else None
+        gnn_group_tracker = GNNPostProcessor()
+        gnn_meas_group_tracker = GNNPostProcessor() if enable_meas_diagnostic else None
+        gnn_no_gate_group_tracker = GNNPostProcessor() if enable_uncertainty_ablation else None
         baseline_tracker.reset()
         gm_cphd_tracker.reset()
         cbmember_tracker.reset()
         graph_mb_tracker.reset()
 
+        gnn_point_assoc = GroupConstrainedPointAssociator()
+        gnn_meas_point_assoc = GroupConstrainedPointAssociator() if enable_meas_diagnostic else None
+        gnn_no_gate_point_assoc = GroupConstrainedPointAssociator() if enable_uncertainty_ablation else None
         baseline_point_assoc = GroupConstrainedPointAssociator()
         gm_point_assoc = GroupConstrainedPointAssociator()
         cb_point_assoc = GroupConstrainedPointAssociator()
@@ -370,7 +396,11 @@ def run_evaluation():
             t0 = time.time()
             corrected_pos = infer_corrected_points(gnn_model, graph, meas_points, device, head='point')
             filtered_corrected_pos, _, _ = filter_clustered_points(corrected_pos)
-            pred_pos_gnn, pred_id_gnn = gnn_processor.update(filtered_corrected_pos)
+            pred_pos_gnn, pred_id_gnn = run_hgat_point_identity_pipeline(
+                filtered_corrected_pos,
+                gnn_group_tracker,
+                gnn_point_assoc,
+            )
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
             metrics['H-GAT-GT (Ours)'].update(gt_pos, gt_ids, pred_pos_gnn, pred_id_gnn)
@@ -378,7 +408,11 @@ def run_evaluation():
             if enable_meas_diagnostic:
                 t0 = time.time()
                 filtered_meas_points, _, _ = filter_clustered_points(meas_points)
-                pred_pos_gnn_meas, pred_id_gnn_meas = gnn_meas_processor.update(filtered_meas_points)
+                pred_pos_gnn_meas, pred_id_gnn_meas = run_hgat_point_identity_pipeline(
+                    filtered_meas_points,
+                    gnn_meas_group_tracker,
+                    gnn_meas_point_assoc,
+                )
                 t1 = time.time()
                 metrics['H-GAT-GT (Meas Ablation)'].update_time(t1 - t0)
                 metrics['H-GAT-GT (Meas Ablation)'].update(gt_pos, gt_ids, pred_pos_gnn_meas, pred_id_gnn_meas)
@@ -394,7 +428,11 @@ def run_evaluation():
                     use_uncertainty_gating=False,
                 )
                 filtered_no_gate_pos, _, _ = filter_clustered_points(corrected_pos_no_gate)
-                pred_pos_no_gate, pred_id_no_gate = gnn_no_gate_processor.update(filtered_no_gate_pos)
+                pred_pos_no_gate, pred_id_no_gate = run_hgat_point_identity_pipeline(
+                    filtered_no_gate_pos,
+                    gnn_no_gate_group_tracker,
+                    gnn_no_gate_point_assoc,
+                )
                 t1 = time.time()
                 metrics['H-GAT-GT (No Uncertainty Gating)'].update_time(t1 - t0)
                 metrics['H-GAT-GT (No Uncertainty Gating)'].update(gt_pos, gt_ids, pred_pos_no_gate, pred_id_no_gate)
@@ -449,6 +487,7 @@ def run_evaluation():
     print(f'Prediction-side point filtering: DBSCAN eps={POINT_CLUSTER_EPS}, min_samples={POINT_CLUSTER_MIN_SAMPLES}; only non-noise points enter point tracking.')
     print(f'Point tracker thresholds: stage1={POINT_TRACK_STAGE1_THRESHOLD}, recovery={POINT_TRACK_RECOVERY_THRESHOLD}, max_age={POINT_TRACK_MAX_AGE}, metric_match={POINT_MATCH_THRESHOLD}.')
     print(f'Point IDSW gap tolerance: {POINT_ID_SWITCH_GAP_TOLERANCE} frame(s).')
+    print('H-GAT-GT point IDs now use group tracking plus group-constrained point association.')
     if enable_meas_diagnostic:
         print('Diagnostic row included: H-GAT-GT (Meas Ablation) tracks filtered raw meas_points to compare against corrected_pos.')
     if enable_uncertainty_ablation:
