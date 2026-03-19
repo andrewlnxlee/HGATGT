@@ -5,9 +5,10 @@ from sklearn.metrics.pairwise import euclidean_distances
 from collections import Counter
 
 class TrackingMetrics:
-    def __init__(self, ospa_c=50.0, ospa_p=2):
+    def __init__(self, ospa_c=50.0, ospa_p=2, match_threshold=40.0):
         self.ospa_c = ospa_c
         self.ospa_p = ospa_p
+        self.match_threshold = match_threshold
         self.reset()
 
     def reset(self):
@@ -41,6 +42,9 @@ class TrackingMetrics:
         # --- G-IoU 相关 ---
         self.total_giou = 0.0  # 改名更加明确
         self.giou_matches = 0
+
+    def reset_sequence(self):
+        self.gt_id_map = {}
 
     def update_time(self, seconds):
         self.total_time_sec += seconds
@@ -142,7 +146,7 @@ class TrackingMetrics:
         
         matches = []
         for r, c in zip(row_ind, col_ind):
-            if dist_matrix[r, c] < 40.0:
+            if dist_matrix[r, c] < self.match_threshold:
                 matches.append((r, c))
         
         self.total_matches += len(matches)

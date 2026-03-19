@@ -15,11 +15,13 @@ class ActiveInteractionScenarioEngine:
         # --- 修改点1：大幅提高速度上限，确保能飞完半张地图 ---
         self.min_speed = 10.0   # 原来是 6.0
         self.max_speed = 25.0   # 原来是 15.0
+        self.next_member_id = 1
 
     def generate_episode(self):
         """
         场景概率调整：稍微增加混合场景的概率，让画面更丰富
         """
+        self.next_member_id = 1
         prob = random.random()
         if prob < 0.4:
             return self._run_converge_scenario() # 40% 纯汇聚
@@ -27,6 +29,22 @@ class ActiveInteractionScenarioEngine:
             return self._run_diverge_scenario()  # 30% 纯分裂
         else:
             return self._run_mixed_scenario()    # 30% 混合
+
+    def _new_member_ids(self, num_members):
+        member_ids = np.arange(self.next_member_id, self.next_member_id + num_members, dtype=np.int64)
+        self.next_member_id += num_members
+        return member_ids
+
+    def _append_members(self, group, new_offsets):
+        new_offsets = np.asarray(new_offsets, dtype=float).reshape(-1, 2)
+        if len(new_offsets) == 0:
+            return
+        group['offsets'] = np.vstack([group['offsets'], new_offsets])
+        group['member_vels'] = np.vstack([group['member_vels'], np.zeros_like(new_offsets)])
+        group['member_ids'] = np.concatenate([group['member_ids'], self._new_member_ids(len(new_offsets))])
+
+    def _new_frame_info(self):
+        return {'meas': [], 'labels': [], 'gt_centers': [], 'gt_points': [], 'point_ids': []}
 
     # ==========================
     # 辅助：智能生成群 (保证能飞到终点)
@@ -82,14 +100,16 @@ class ActiveInteractionScenarioEngine:
         vel = dir_vec * speed
         
         num_members = random.randint(5, 15)
-        
+        member_ids = self._new_member_ids(num_members)
+
         return {
             'c': pos,
             'v': vel,
             'offsets': np.random.randn(num_members, 2) * 8.0,
             'member_vels': np.zeros((num_members, 2)),
+            'member_ids': member_ids,
             'active': True,
-            'target': target_pos, 
+            'target': target_pos,
             'role': 'merger'
         }
 
@@ -110,11 +130,9 @@ class ActiveInteractionScenarioEngine:
             assigned_rp = random.choice(rps)
             groups[i+1] = self._spawn_group_aiming_at(i+1, assigned_rp)
             
-        merged_pairs = set()
-        
         episode_data = []
         for t in range(self.num_frames):
-            frame_info = {'meas': [], 'labels': [], 'gt_centers': []}
+            frame_info = self._new_frame_info()
             
             # --- 交互逻辑 ---
             active_ids = list(groups.keys())
@@ -133,6 +151,7 @@ class ActiveInteractionScenarioEngine:
                         g1, g2 = groups[id1], groups[id2]
                         g1['offsets'] = np.vstack([g1['offsets'], g2['offsets']])
                         g1['member_vels'] = np.vstack([g1['member_vels'], g2['member_vels']])
+                        g1['member_ids'] = np.concatenate([g1['member_ids'], g2['member_ids']])
                         # 速度融合
                         g1['v'] = (g1['v'] + g2['v']) * 0.5
                         del groups[id2]
@@ -175,17 +194,16 @@ class ActiveInteractionScenarioEngine:
                 
             if len(g['offsets']) < 12:
                 extra = np.random.randn(8, 2) * 8.0
-                g['offsets'] = np.vstack([g['offsets'], extra])
-                g['member_vels'] = np.vstack([g['member_vels'], np.zeros_like(extra)])
+                self._append_members(g, extra)
                 
             g['split_time'] = random.randint(int(self.num_frames*0.3), int(self.num_frames*0.6))
             groups[i+1] = g
             
         episode_data = []
         next_id = max(groups.keys()) + 1
-        
+
         for t in range(self.num_frames):
-            frame_info = {'meas': [], 'labels': [], 'gt_centers': []}
+            frame_info = self._new_frame_info()
             
             # --- 分裂检测 ---
             current_ids = list(groups.keys())
@@ -205,15 +223,17 @@ class ActiveInteractionScenarioEngine:
                         'v': parent['v'].copy(),
                         'offsets': parent['offsets'][half:].copy(),
                         'member_vels': parent['member_vels'][half:].copy(),
+                        'member_ids': parent['member_ids'][half:].copy(),
                         'active': True,
                         # 分裂后给个新目标，稍微偏离原目标
-                        'target': parent['target'] + orth_vec * 400 
+                        'target': parent['target'] + orth_vec * 400
                     }
                     child['v'] += orth_vec * 4.0 # 侧向推力加大
                     
                     parent['offsets'] = parent['offsets'][:half]
                     parent['member_vels'] = parent['member_vels'][:half]
-                    parent['v'] -= orth_vec * 2.0 
+                    parent['member_ids'] = parent['member_ids'][:half]
+                    parent['v'] -= orth_vec * 2.0
                     
                     groups[next_id] = child
                     next_id += 1
@@ -243,8 +263,7 @@ class ActiveInteractionScenarioEngine:
         g1['v'] = g1['v'] / np.linalg.norm(g1['v']) * 20.0 
         # 加人
         extra = np.random.randn(12, 2) * 8.0
-        g1['offsets'] = np.vstack([g1['offsets'], extra])
-        g1['member_vels'] = np.vstack([g1['member_vels'], np.zeros_like(extra)])
+        self._append_members(g1, extra)
         groups[1] = g1
         
         # 2. 必有: 汇聚群 (相向而行，速度极快)
@@ -262,9 +281,9 @@ class ActiveInteractionScenarioEngine:
         
         next_id = 4
         episode_data = []
-        
+
         for t in range(self.num_frames):
-            frame_info = {'meas': [], 'labels': [], 'gt_centers': []}
+            frame_info = self._new_frame_info()
             
             # 分裂
             if 1 in groups and t == groups[1].get('split_time', -1):
@@ -278,11 +297,13 @@ class ActiveInteractionScenarioEngine:
                     'v': parent['v'].copy() + orth_vec * 5.0, # 强力侧推
                     'offsets': parent['offsets'][half:].copy(),
                     'member_vels': parent['member_vels'][half:].copy(),
+                    'member_ids': parent['member_ids'][half:].copy(),
                     'active': True,
                     'target': parent['target']
                 }
                 parent['offsets'] = parent['offsets'][:half]
                 parent['member_vels'] = parent['member_vels'][:half]
+                parent['member_ids'] = parent['member_ids'][:half]
                 groups[next_id] = child
                 next_id += 1
             
@@ -294,6 +315,7 @@ class ActiveInteractionScenarioEngine:
                      g_del = groups[3]
                      g_keep['offsets'] = np.vstack([g_keep['offsets'], g_del['offsets']])
                      g_keep['member_vels'] = np.vstack([g_keep['member_vels'], g_del['member_vels']])
+                     g_keep['member_ids'] = np.concatenate([g_keep['member_ids'], g_del['member_ids']])
                      del groups[3]
 
             for gid, g in groups.items():
@@ -354,36 +376,53 @@ class ActiveInteractionScenarioEngine:
         for _ in range(n_clutter):
             frame_info['meas'].append([random.uniform(0, 1000), random.uniform(0, 1000)])
             frame_info['labels'].append(0)
+            frame_info['point_ids'].append(0)
 
         for gid, g in groups.items():
-            if 'member_vels' not in g: g['member_vels'] = np.zeros_like(g['offsets'])
-            
+            if 'member_vels' not in g:
+                g['member_vels'] = np.zeros_like(g['offsets'])
+            if 'member_ids' not in g:
+                g['member_ids'] = self._new_member_ids(len(g['offsets']))
+
             force = -0.05 * g['offsets']
             g['member_vels'] += force + np.random.randn(*g['offsets'].shape) * 0.5
             g['member_vels'] *= 0.9
             g['offsets'] += g['member_vels']
-            
+
             frame_info['gt_centers'].append([gid, g['c'][0], g['c'][1]])
-            
+
             true_pts = g['c'] + g['offsets']
-            for pt in true_pts:
+            for member_id, pt in zip(g['member_ids'], true_pts):
                 # 视野检查
                 if pt[0] < 0 or pt[0] > 1000 or pt[1] < 0 or pt[1] > 1000:
-                    continue 
-                
+                    continue
+
+                frame_info['gt_points'].append([member_id, pt[0], pt[1]])
+
                 if random.random() < self.detection_prob:
                     noise = np.random.randn(2) * 1.5
                     frame_info['meas'].append(pt + noise)
                     frame_info['labels'].append(gid)
-        
+                    frame_info['point_ids'].append(member_id)
+
         if len(frame_info['meas']) > 0:
-            frame_info['meas'] = np.array(frame_info['meas'])
-            frame_info['labels'] = np.array(frame_info['labels'])
-            frame_info['gt_centers'] = np.array(frame_info['gt_centers'])
+            frame_info['meas'] = np.array(frame_info['meas'], dtype=np.float32)
+            frame_info['labels'] = np.array(frame_info['labels'], dtype=np.int64)
+            frame_info['point_ids'] = np.array(frame_info['point_ids'], dtype=np.int64)
         else:
-            frame_info['meas'] = np.zeros((0,2))
-            frame_info['labels'] = np.zeros((0,))
-            frame_info['gt_centers'] = np.zeros((0,3))
+            frame_info['meas'] = np.zeros((0, 2), dtype=np.float32)
+            frame_info['labels'] = np.zeros((0,), dtype=np.int64)
+            frame_info['point_ids'] = np.zeros((0,), dtype=np.int64)
+
+        if len(frame_info['gt_centers']) > 0:
+            frame_info['gt_centers'] = np.array(frame_info['gt_centers'], dtype=np.float32)
+        else:
+            frame_info['gt_centers'] = np.zeros((0, 3), dtype=np.float32)
+
+        if len(frame_info['gt_points']) > 0:
+            frame_info['gt_points'] = np.array(frame_info['gt_points'], dtype=np.float32)
+        else:
+            frame_info['gt_points'] = np.zeros((0, 3), dtype=np.float32)
 
 def save_dataset(split_name, num_samples):
     folder = os.path.join(config.DATA_ROOT, split_name)
