@@ -139,19 +139,54 @@ def extract_detected_point_gt(graph, episode_idx, frame_idx):
     return gt_pos, gt_ids
 
 
-def infer_corrected_points(gnn_model, graph, meas_points, device):
+def unpack_head_outputs(model_out, head='group'):
+    if hasattr(model_out, 'get_offsets') and hasattr(model_out, 'get_uncertainty'):
+        return model_out.get_offsets(head), model_out.get_uncertainty(head)
+
+    if not isinstance(model_out, (tuple, list)):
+        raise ValueError('模型输出格式不受支持。')
+
+    if len(model_out) >= 5:
+        if head == 'group':
+            return model_out[1], model_out[2]
+        if head == 'point':
+            return model_out[3], model_out[4]
+    if len(model_out) >= 3:
+        return model_out[1], model_out[2]
+    if len(model_out) >= 2:
+        return model_out[1], None
+    raise ValueError('模型输出缺少 offset 信息。')
+
+
+def apply_point_uncertainty_gating(offsets, uncertainty):
+    if uncertainty is None or not getattr(config, 'ENABLE_POINT_UNCERTAINTY_GATING', False):
+        return offsets
+
+    gate_scale = float(getattr(config, 'POINT_UNCERTAINTY_GATE_SCALE', 1.0))
+    uncertainty = np.asarray(uncertainty, dtype=float).reshape(-1, 2)
+    mean_uncertainty = np.mean(uncertainty, axis=1, keepdims=True)
+    gains = 1.0 / (1.0 + gate_scale * mean_uncertainty)
+    return offsets * gains
+
+
+def infer_corrected_points(gnn_model, graph, meas_points, device, head='point'):
     meas_points = np.asarray(meas_points, dtype=float).reshape(-1, 2)
     if gnn_model is None or len(meas_points) == 0 or graph.edge_index.shape[1] == 0:
         return meas_points
 
     graph_dev = graph.to(device)
     with torch.no_grad():
-        out = gnn_model(graph_dev)
-        offsets = out[1] if isinstance(out, (tuple, list)) else out
+        model_out = gnn_model(graph_dev)
+        offsets, uncertainty = unpack_head_outputs(model_out, head=head)
 
     offsets = offsets.detach().cpu().numpy().reshape(-1, 2)
     if len(offsets) != len(meas_points):
         raise ValueError(f"offset 数量与 meas 数量不一致: {len(offsets)} vs {len(meas_points)}")
+
+    if uncertainty is not None and head == 'point':
+        uncertainty = uncertainty.detach().cpu().numpy().reshape(-1, 2)
+        offsets = apply_point_uncertainty_gating(offsets, uncertainty)
+
     return meas_points + offsets
 
 
@@ -236,7 +271,11 @@ def run_evaluation():
     if len(test_set) == 0:
         return
 
-    gnn_model = GNNGroupTracker().to(device)
+    gnn_model = GNNGroupTracker(
+        input_node_dim=config.INPUT_DIM,
+        input_edge_dim=config.EDGE_DIM,
+        hidden_dim=config.HIDDEN_DIM,
+    ).to(device)
     if os.path.exists(config.MODEL_USE_PATH):
         gnn_model.load_state_dict(torch.load(config.MODEL_USE_PATH, map_location=device))
         gnn_model.eval()
@@ -288,7 +327,7 @@ def run_evaluation():
 
             # H-GAT-GT
             t0 = time.time()
-            corrected_pos = infer_corrected_points(gnn_model, graph, meas_points, device)
+            corrected_pos = infer_corrected_points(gnn_model, graph, meas_points, device, head='point')
             pred_pos_gnn, pred_id_gnn = gnn_processor.update(corrected_pos)
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
