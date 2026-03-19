@@ -3,9 +3,9 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
 
-POINT_TRACK_MAX_AGE = 20
-POINT_TRACK_STAGE1_THRESHOLD = 14.0
-POINT_TRACK_RECOVERY_THRESHOLD = 22.0
+POINT_TRACK_MAX_AGE = 15
+POINT_TRACK_STAGE1_THRESHOLD = 20.0
+POINT_TRACK_RECOVERY_THRESHOLD = 28.0
 
 
 class GNNPointPostProcessor:

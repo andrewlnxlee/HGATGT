@@ -36,6 +36,7 @@ POINT_TRACK_RECOVERY_THRESHOLD = float(
 )
 POINT_TRACK_MAX_AGE = int(getattr(config, 'POINT_TRACK_MAX_AGE', DEFAULT_POINT_TRACK_MAX_AGE))
 POINT_MATCH_THRESHOLD = float(getattr(config, 'POINT_MATCH_THRESHOLD', POINT_TRACK_RECOVERY_THRESHOLD))
+POINT_ID_SWITCH_GAP_TOLERANCE = getattr(config, 'POINT_ID_SWITCH_GAP_TOLERANCE', 0)
 POINT_CLUSTER_EPS = float(getattr(config, 'POINT_CLUSTER_EPS', 35))
 POINT_CLUSTER_MIN_SAMPLES = int(getattr(config, 'POINT_CLUSTER_MIN_SAMPLES', 3))
 POINT_OSPA_C = 25.0
@@ -274,7 +275,11 @@ def get_rfs_point_group_ids(points, detected_centroids, centroid_to_points, rfs_
 
 
 def create_metrics():
-    return TrackingMetrics(ospa_c=POINT_OSPA_C, match_threshold=POINT_MATCH_THRESHOLD)
+    return TrackingMetrics(
+        ospa_c=POINT_OSPA_C,
+        match_threshold=POINT_MATCH_THRESHOLD,
+        id_switch_gap_tolerance=POINT_ID_SWITCH_GAP_TOLERANCE,
+    )
 
 
 def filter_clustered_points(points, eps=POINT_CLUSTER_EPS, min_samples=POINT_CLUSTER_MIN_SAMPLES):
@@ -443,6 +448,7 @@ def run_evaluation():
     print('Note: point-level MOTA is auxiliary under detected-only GT; interpret OSPA / RMSE / IDSW first.')
     print(f'Prediction-side point filtering: DBSCAN eps={POINT_CLUSTER_EPS}, min_samples={POINT_CLUSTER_MIN_SAMPLES}; only non-noise points enter point tracking.')
     print(f'Point tracker thresholds: stage1={POINT_TRACK_STAGE1_THRESHOLD}, recovery={POINT_TRACK_RECOVERY_THRESHOLD}, max_age={POINT_TRACK_MAX_AGE}, metric_match={POINT_MATCH_THRESHOLD}.')
+    print(f'Point IDSW gap tolerance: {POINT_ID_SWITCH_GAP_TOLERANCE} frame(s).')
     if enable_meas_diagnostic:
         print('Diagnostic row included: H-GAT-GT (Meas Ablation) tracks filtered raw meas_points to compare against corrected_pos.')
     if enable_uncertainty_ablation:

@@ -5,10 +5,11 @@ from sklearn.metrics.pairwise import euclidean_distances
 from collections import Counter
 
 class TrackingMetrics:
-    def __init__(self, ospa_c=50.0, ospa_p=2, match_threshold=40.0):
+    def __init__(self, ospa_c=50.0, ospa_p=2, match_threshold=40.0, id_switch_gap_tolerance=None):
         self.ospa_c = ospa_c
         self.ospa_p = ospa_p
         self.match_threshold = match_threshold
+        self.id_switch_gap_tolerance = id_switch_gap_tolerance
         self.reset()
 
     def reset(self):
@@ -38,6 +39,7 @@ class TrackingMetrics:
         self.total_points = 0
 
         self.gt_id_map = {}
+        self.gt_last_match_frame = {}
 
         # --- G-IoU 相关 ---
         self.total_giou = 0.0  # 改名更加明确
@@ -45,6 +47,7 @@ class TrackingMetrics:
 
     def reset_sequence(self):
         self.gt_id_map = {}
+        self.gt_last_match_frame = {}
 
     def update_time(self, seconds):
         self.total_time_sec += seconds
@@ -160,11 +163,18 @@ class TrackingMetrics:
 
             gt_id = gt_ids[r]
             track_id = pred_ids[c]
+            prev_track_id = self.gt_id_map.get(gt_id)
+            prev_match_frame = self.gt_last_match_frame.get(gt_id)
 
-            if gt_id in self.gt_id_map:
-                if self.gt_id_map[gt_id] != track_id:
-                    self.total_id_switches += 1
+            count_id_switch = prev_track_id is not None and prev_track_id != track_id
+            if count_id_switch and self.id_switch_gap_tolerance is not None and prev_match_frame is not None:
+                frame_gap = self.total_frames - prev_match_frame
+                count_id_switch = frame_gap <= (self.id_switch_gap_tolerance + 1)
+            if count_id_switch:
+                self.total_id_switches += 1
+
             self.gt_id_map[gt_id] = track_id
+            self.gt_last_match_frame[gt_id] = self.total_frames
 
             # --- G-IoU 计算 ---
             # 只有当形状信息可用时才计算
