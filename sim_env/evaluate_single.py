@@ -21,19 +21,30 @@ from trackers.cbmember import CBMeMBerTracker
 from trackers.gm_cphd import GMCPHDTracker
 from trackers.gnn_processor_single import (
     GNNPointPostProcessor,
-    POINT_TRACK_MAX_AGE,
-    POINT_TRACK_RECOVERY_THRESHOLD,
-    POINT_TRACK_STAGE1_THRESHOLD,
+    POINT_TRACK_MAX_AGE as DEFAULT_POINT_TRACK_MAX_AGE,
+    POINT_TRACK_RECOVERY_THRESHOLD as DEFAULT_POINT_TRACK_RECOVERY_THRESHOLD,
+    POINT_TRACK_STAGE1_THRESHOLD as DEFAULT_POINT_TRACK_STAGE1_THRESHOLD,
 )
 from trackers.graph_mb import GraphMBTracker
 
 
-POINT_MATCH_THRESHOLD = POINT_TRACK_STAGE1_THRESHOLD
+POINT_TRACK_STAGE1_THRESHOLD = float(
+    getattr(config, 'POINT_TRACK_STAGE1_THRESHOLD', DEFAULT_POINT_TRACK_STAGE1_THRESHOLD)
+)
+POINT_TRACK_RECOVERY_THRESHOLD = float(
+    getattr(config, 'POINT_TRACK_RECOVERY_THRESHOLD', DEFAULT_POINT_TRACK_RECOVERY_THRESHOLD)
+)
+POINT_TRACK_MAX_AGE = int(getattr(config, 'POINT_TRACK_MAX_AGE', DEFAULT_POINT_TRACK_MAX_AGE))
+POINT_MATCH_THRESHOLD = float(getattr(config, 'POINT_MATCH_THRESHOLD', POINT_TRACK_RECOVERY_THRESHOLD))
+POINT_CLUSTER_EPS = float(getattr(config, 'POINT_CLUSTER_EPS', 35))
+POINT_CLUSTER_MIN_SAMPLES = int(getattr(config, 'POINT_CLUSTER_MIN_SAMPLES', 3))
 POINT_OSPA_C = 25.0
-GROUP_TO_POINT_ASSOC_THRESH = POINT_TRACK_RECOVERY_THRESHOLD
-GROUP_TO_CENTROID_THRESH = POINT_TRACK_STAGE1_THRESHOLD
-GROUP_POINT_MAX_AGE = min(POINT_TRACK_MAX_AGE, 4)
-ENABLE_MEAS_DIAGNOSTIC = True
+GROUP_TO_POINT_ASSOC_THRESH = float(getattr(config, 'GROUP_TO_POINT_ASSOC_THRESH', POINT_TRACK_RECOVERY_THRESHOLD))
+GROUP_TO_CENTROID_THRESH = float(getattr(config, 'GROUP_TO_CENTROID_THRESH', POINT_TRACK_STAGE1_THRESHOLD))
+GROUP_POINT_MAX_AGE = int(getattr(config, 'GROUP_POINT_MAX_AGE', min(POINT_TRACK_MAX_AGE, 4)))
+ENABLE_MEAS_DIAGNOSTIC = bool(getattr(config, 'ENABLE_MEAS_DIAGNOSTIC', True))
+ENABLE_POINT_UNCERTAINTY_GATING = bool(getattr(config, 'ENABLE_POINT_UNCERTAINTY_GATING', False))
+ENABLE_POINT_UNCERTAINTY_ABLATION = bool(getattr(config, 'ENABLE_POINT_UNCERTAINTY_ABLATION', False))
 
 
 class GroupConstrainedPointAssociator:
@@ -158,8 +169,8 @@ def unpack_head_outputs(model_out, head='group'):
     raise ValueError('模型输出缺少 offset 信息。')
 
 
-def apply_point_uncertainty_gating(offsets, uncertainty):
-    if uncertainty is None or not getattr(config, 'ENABLE_POINT_UNCERTAINTY_GATING', False):
+def apply_point_uncertainty_gating(offsets, uncertainty, enabled=ENABLE_POINT_UNCERTAINTY_GATING):
+    if uncertainty is None or not enabled:
         return offsets
 
     gate_scale = float(getattr(config, 'POINT_UNCERTAINTY_GATE_SCALE', 1.0))
@@ -169,7 +180,7 @@ def apply_point_uncertainty_gating(offsets, uncertainty):
     return offsets * gains
 
 
-def infer_corrected_points(gnn_model, graph, meas_points, device, head='point'):
+def infer_corrected_points(gnn_model, graph, meas_points, device, head='point', use_uncertainty_gating=None):
     meas_points = np.asarray(meas_points, dtype=float).reshape(-1, 2)
     if gnn_model is None or len(meas_points) == 0 or graph.edge_index.shape[1] == 0:
         return meas_points
@@ -185,12 +196,14 @@ def infer_corrected_points(gnn_model, graph, meas_points, device, head='point'):
 
     if uncertainty is not None and head == 'point':
         uncertainty = uncertainty.detach().cpu().numpy().reshape(-1, 2)
-        offsets = apply_point_uncertainty_gating(offsets, uncertainty)
+        if use_uncertainty_gating is None:
+            use_uncertainty_gating = ENABLE_POINT_UNCERTAINTY_GATING
+        offsets = apply_point_uncertainty_gating(offsets, uncertainty, enabled=use_uncertainty_gating)
 
     return meas_points + offsets
 
 
-def cluster_measurements(points, eps=35, min_samples=3):
+def cluster_measurements(points, eps=POINT_CLUSTER_EPS, min_samples=POINT_CLUSTER_MIN_SAMPLES):
     points = np.asarray(points, dtype=float).reshape(-1, 2)
     if len(points) == 0:
         return np.zeros((0,), dtype=int), np.zeros((0, 2), dtype=float), {}
@@ -264,6 +277,13 @@ def create_metrics():
     return TrackingMetrics(ospa_c=POINT_OSPA_C, match_threshold=POINT_MATCH_THRESHOLD)
 
 
+def filter_clustered_points(points, eps=POINT_CLUSTER_EPS, min_samples=POINT_CLUSTER_MIN_SAMPLES):
+    labels, _, _ = cluster_measurements(points, eps=eps, min_samples=min_samples)
+    keep_mask = labels != -1
+    filtered_points = np.asarray(points, dtype=float).reshape(-1, 2)[keep_mask]
+    return filtered_points, keep_mask, labels
+
+
 def run_evaluation():
     device = torch.device(config.DEVICE)
     print(f"Loading Test Data from {config.DATA_ROOT}...")
@@ -282,7 +302,7 @@ def run_evaluation():
     else:
         gnn_model = None
 
-    baseline_tracker = BaselineTracker(eps=35, min_samples=3)
+    baseline_tracker = BaselineTracker(eps=POINT_CLUSTER_EPS, min_samples=POINT_CLUSTER_MIN_SAMPLES)
     gm_cphd_tracker = GMCPHDTracker()
     cbmember_tracker = CBMeMBerTracker()
     graph_mb_tracker = GraphMBTracker()
@@ -295,15 +315,31 @@ def run_evaluation():
         'H-GAT-GT (Ours)': create_metrics(),
     }
     enable_meas_diagnostic = ENABLE_MEAS_DIAGNOSTIC and gnn_model is not None
+    enable_uncertainty_ablation = ENABLE_POINT_UNCERTAINTY_ABLATION and gnn_model is not None
     if enable_meas_diagnostic:
         metrics['H-GAT-GT (Meas Ablation)'] = create_metrics()
+    if enable_uncertainty_ablation:
+        metrics['H-GAT-GT (No Uncertainty Gating)'] = create_metrics()
 
     print('Running Point-Level Evaluation Loop (detected-only GT)...')
     for episode_idx in tqdm(range(len(test_set))):
         episode_graphs = test_set.get(episode_idx)
 
-        gnn_processor = GNNPointPostProcessor()
-        gnn_meas_processor = GNNPointPostProcessor() if enable_meas_diagnostic else None
+        gnn_processor = GNNPointPostProcessor(
+            max_age=POINT_TRACK_MAX_AGE,
+            stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
+            stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
+        )
+        gnn_meas_processor = GNNPointPostProcessor(
+            max_age=POINT_TRACK_MAX_AGE,
+            stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
+            stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
+        ) if enable_meas_diagnostic else None
+        gnn_no_gate_processor = GNNPointPostProcessor(
+            max_age=POINT_TRACK_MAX_AGE,
+            stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
+            stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
+        ) if enable_uncertainty_ablation else None
         baseline_tracker.reset()
         gm_cphd_tracker.reset()
         cbmember_tracker.reset()
@@ -323,22 +359,40 @@ def run_evaluation():
             gt_pos, gt_ids = extract_detected_point_gt(graph, episode_idx, frame_idx)
             meas_points = graph.x.cpu().numpy()
 
-            _, detected_centroids, centroid_to_points = cluster_measurements(meas_points, eps=35, min_samples=3)
+            _, detected_centroids, centroid_to_points = cluster_measurements(meas_points)
 
             # H-GAT-GT
             t0 = time.time()
             corrected_pos = infer_corrected_points(gnn_model, graph, meas_points, device, head='point')
-            pred_pos_gnn, pred_id_gnn = gnn_processor.update(corrected_pos)
+            filtered_corrected_pos, _, _ = filter_clustered_points(corrected_pos)
+            pred_pos_gnn, pred_id_gnn = gnn_processor.update(filtered_corrected_pos)
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
             metrics['H-GAT-GT (Ours)'].update(gt_pos, gt_ids, pred_pos_gnn, pred_id_gnn)
 
             if enable_meas_diagnostic:
                 t0 = time.time()
-                pred_pos_gnn_meas, pred_id_gnn_meas = gnn_meas_processor.update(meas_points)
+                filtered_meas_points, _, _ = filter_clustered_points(meas_points)
+                pred_pos_gnn_meas, pred_id_gnn_meas = gnn_meas_processor.update(filtered_meas_points)
                 t1 = time.time()
                 metrics['H-GAT-GT (Meas Ablation)'].update_time(t1 - t0)
                 metrics['H-GAT-GT (Meas Ablation)'].update(gt_pos, gt_ids, pred_pos_gnn_meas, pred_id_gnn_meas)
+
+            if enable_uncertainty_ablation:
+                t0 = time.time()
+                corrected_pos_no_gate = infer_corrected_points(
+                    gnn_model,
+                    graph,
+                    meas_points,
+                    device,
+                    head='point',
+                    use_uncertainty_gating=False,
+                )
+                filtered_no_gate_pos, _, _ = filter_clustered_points(corrected_pos_no_gate)
+                pred_pos_no_gate, pred_id_no_gate = gnn_no_gate_processor.update(filtered_no_gate_pos)
+                t1 = time.time()
+                metrics['H-GAT-GT (No Uncertainty Gating)'].update_time(t1 - t0)
+                metrics['H-GAT-GT (No Uncertainty Gating)'].update(gt_pos, gt_ids, pred_pos_no_gate, pred_id_no_gate)
 
             # Baseline
             t0 = time.time()
@@ -387,8 +441,11 @@ def run_evaluation():
     print('FINAL POINT-LEVEL RESULTS (DETECTED-ONLY GT)')
     print('=' * 100)
     print('Note: point-level MOTA is auxiliary under detected-only GT; interpret OSPA / RMSE / IDSW first.')
+    print(f'Prediction-side point filtering: DBSCAN eps={POINT_CLUSTER_EPS}, min_samples={POINT_CLUSTER_MIN_SAMPLES}; only non-noise points enter point tracking.')
     if enable_meas_diagnostic:
-        print('Diagnostic row included: H-GAT-GT (Meas Ablation) tracks raw meas_points to compare against corrected_pos.')
+        print('Diagnostic row included: H-GAT-GT (Meas Ablation) tracks filtered raw meas_points to compare against corrected_pos.')
+    if enable_uncertainty_ablation:
+        print('Ablation row included: H-GAT-GT (No Uncertainty Gating) disables point uncertainty gating with the same checkpoint.')
     print(df.to_string())
     print('=' * 100)
 
