@@ -52,8 +52,23 @@ def load_model(model, weight_path, device, label):
     if not os.path.exists(weight_path):
         print(f'Warning: checkpoint not found for {label}: {weight_path}')
         return None
+
     state_dict = torch.load(weight_path, map_location=device)
-    model.load_state_dict(state_dict)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        legacy_checkpoint = any(key.startswith('offset_regressor.') or key.startswith('bns.') for key in state_dict.keys())
+        if legacy_checkpoint:
+            print(
+                f'Warning: {label} checkpoint is a legacy group-level/single-head weight and cannot be used '
+                'for the new point-level ablation pipeline. Retrain this variant with '
+                'sim_env/run_ablation/train_ablation.py, then rerun this script.'
+            )
+        else:
+            first_line = str(exc).splitlines()[0]
+            print(f'Warning: failed to load {label} checkpoint from {weight_path}: {first_line}')
+        return None
+
     model.to(device).eval()
     return model
 
