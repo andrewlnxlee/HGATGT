@@ -3,14 +3,24 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
 
+POINT_TRACK_MAX_AGE = 15
+POINT_TRACK_STAGE1_THRESHOLD = 20.0
+POINT_TRACK_RECOVERY_THRESHOLD = 28.0
+
+
 class GNNPointPostProcessor:
-    def __init__(self):
+    def __init__(
+        self,
+        max_age=POINT_TRACK_MAX_AGE,
+        stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
+        stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
+    ):
         self.tracks = {}
         self.next_id = 1
 
-        self.max_age = 15
-        self.stage1_thresh = 20.0
-        self.stage2_thresh = 45.0
+        self.max_age = max_age
+        self.stage1_thresh = stage1_thresh
+        self.stage2_thresh = stage2_thresh
 
         dt = 1.0
         self.F = np.array([
@@ -58,14 +68,15 @@ class GNNPointPostProcessor:
             row, col = linear_sum_assignment(dist_cost)
 
             for r, c in zip(row, col):
-                if dist_cost[r, c] < thresh:
-                    tid = t_ids[r]
-                    did = d_ids[c]
-                    if self.tracks[tid]['age'] > 1:
-                        self.tracks[tid]['P'] = self.P_init.copy()
-                    self._update_track(tid, detected_points[did])
-                    unmatched_trks.discard(tid)
-                    unmatched_dets.discard(did)
+                if dist_cost[r, c] >= thresh:
+                    continue
+                tid = t_ids[r]
+                did = d_ids[c]
+                if self.tracks[tid]['age'] > 1:
+                    self.tracks[tid]['P'] = self.P_init.copy()
+                self._update_track(tid, detected_points[did])
+                unmatched_trks.discard(tid)
+                unmatched_dets.discard(did)
 
         associate(self.stage1_thresh, unmatched_trks, unmatched_dets)
         associate(self.stage2_thresh, unmatched_trks, unmatched_dets)

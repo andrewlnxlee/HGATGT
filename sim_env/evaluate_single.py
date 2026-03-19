@@ -19,18 +19,25 @@ from model import GNNGroupTracker
 from trackers.baseline import BaselineTracker
 from trackers.cbmember import CBMeMBerTracker
 from trackers.gm_cphd import GMCPHDTracker
-from trackers.gnn_processor_single import GNNPointPostProcessor
+from trackers.gnn_processor_single import (
+    GNNPointPostProcessor,
+    POINT_TRACK_MAX_AGE,
+    POINT_TRACK_RECOVERY_THRESHOLD,
+    POINT_TRACK_STAGE1_THRESHOLD,
+)
 from trackers.graph_mb import GraphMBTracker
 
 
-POINT_MATCH_THRESHOLD = 15.0
+POINT_MATCH_THRESHOLD = POINT_TRACK_STAGE1_THRESHOLD
 POINT_OSPA_C = 25.0
-GROUP_TO_POINT_ASSOC_THRESH = 45.0
-GROUP_TO_CENTROID_THRESH = 20.0
+GROUP_TO_POINT_ASSOC_THRESH = POINT_TRACK_RECOVERY_THRESHOLD
+GROUP_TO_CENTROID_THRESH = POINT_TRACK_STAGE1_THRESHOLD
+GROUP_POINT_MAX_AGE = min(POINT_TRACK_MAX_AGE, 4)
+ENABLE_MEAS_DIAGNOSTIC = True
 
 
 class GroupConstrainedPointAssociator:
-    def __init__(self, match_threshold=GROUP_TO_POINT_ASSOC_THRESH, max_age=2):
+    def __init__(self, match_threshold=GROUP_TO_POINT_ASSOC_THRESH, max_age=GROUP_POINT_MAX_AGE):
         self.match_threshold = match_threshold
         self.max_age = max_age
         self.reset()
@@ -63,7 +70,7 @@ class GroupConstrainedPointAssociator:
                 row_ind, col_ind = linear_sum_assignment(cost)
 
                 for r, c in zip(row_ind, col_ind):
-                    if cost[r, c] > self.match_threshold:
+                    if cost[r, c] >= self.match_threshold:
                         continue
                     tid = track_ids[r]
                     det_idx = det_indices[c]
@@ -110,6 +117,44 @@ def ensure_point_gt(graph, episode_idx, frame_idx):
         )
 
 
+def extract_detected_point_gt(graph, episode_idx, frame_idx):
+    gt_points_data = graph.gt_points.cpu().numpy()
+    point_ids = graph.point_ids.cpu().numpy().astype(int).reshape(-1)
+    detected_ids = point_ids[point_ids > 0]
+    if len(detected_ids) == 0:
+        return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=int)
+
+    _, first_idx = np.unique(detected_ids, return_index=True)
+    detected_ids = detected_ids[np.sort(first_idx)]
+
+    gt_lookup = {int(row[0]): np.asarray(row[1:3], dtype=float) for row in gt_points_data}
+    missing_ids = [point_id for point_id in detected_ids if point_id not in gt_lookup]
+    if missing_ids:
+        raise ValueError(
+            f"sample {episode_idx} frame {frame_idx} 的 detected-only GT 缺少 member_id={missing_ids[:5]} 的真值坐标。"
+        )
+
+    gt_pos = np.array([gt_lookup[point_id] for point_id in detected_ids], dtype=float).reshape(-1, 2)
+    gt_ids = detected_ids.astype(int)
+    return gt_pos, gt_ids
+
+
+def infer_corrected_points(gnn_model, graph, meas_points, device):
+    meas_points = np.asarray(meas_points, dtype=float).reshape(-1, 2)
+    if gnn_model is None or len(meas_points) == 0 or graph.edge_index.shape[1] == 0:
+        return meas_points
+
+    graph_dev = graph.to(device)
+    with torch.no_grad():
+        out = gnn_model(graph_dev)
+        offsets = out[1] if isinstance(out, (tuple, list)) else out
+
+    offsets = offsets.detach().cpu().numpy().reshape(-1, 2)
+    if len(offsets) != len(meas_points):
+        raise ValueError(f"offset 数量与 meas 数量不一致: {len(offsets)} vs {len(meas_points)}")
+    return meas_points + offsets
+
+
 def cluster_measurements(points, eps=35, min_samples=3):
     points = np.asarray(points, dtype=float).reshape(-1, 2)
     if len(points) == 0:
@@ -154,7 +199,7 @@ def project_cluster_tracks_to_points(points, cluster_labels, track_centers, trac
     cost = euclidean_distances(track_centers, cluster_centers)
     row_ind, col_ind = linear_sum_assignment(cost)
     for r, c in zip(row_ind, col_ind):
-        if cost[r, c] > dist_thresh:
+        if cost[r, c] >= dist_thresh:
             continue
         point_group_ids[cluster_to_points[c]] = track_ids[r]
     return point_group_ids
@@ -173,7 +218,7 @@ def get_rfs_point_group_ids(points, detected_centroids, centroid_to_points, rfs_
     cost = euclidean_distances(rfs_centers, detected_centroids)
     row_ind, col_ind = linear_sum_assignment(cost)
     for r, c in zip(row_ind, col_ind):
-        if cost[r, c] > dist_thresh:
+        if cost[r, c] >= dist_thresh:
             continue
         if c in centroid_to_points:
             point_group_ids[centroid_to_points[c]] = rfs_ids[r]
@@ -210,12 +255,16 @@ def run_evaluation():
         'Graph-MB (Paper)': create_metrics(),
         'H-GAT-GT (Ours)': create_metrics(),
     }
+    enable_meas_diagnostic = ENABLE_MEAS_DIAGNOSTIC and gnn_model is not None
+    if enable_meas_diagnostic:
+        metrics['H-GAT-GT (Meas Ablation)'] = create_metrics()
 
-    print('Running Point-Level Evaluation Loop (5 Trackers)...')
+    print('Running Point-Level Evaluation Loop (detected-only GT)...')
     for episode_idx in tqdm(range(len(test_set))):
         episode_graphs = test_set.get(episode_idx)
 
         gnn_processor = GNNPointPostProcessor()
+        gnn_meas_processor = GNNPointPostProcessor() if enable_meas_diagnostic else None
         baseline_tracker.reset()
         gm_cphd_tracker.reset()
         cbmember_tracker.reset()
@@ -232,35 +281,25 @@ def run_evaluation():
         for frame_idx, graph in enumerate(episode_graphs):
             ensure_point_gt(graph, episode_idx, frame_idx)
 
-            gt_points_data = graph.gt_points.cpu().numpy()
-            gt_pos = gt_points_data[:, 1:3] if len(gt_points_data) > 0 else np.zeros((0, 2), dtype=float)
-            gt_ids = gt_points_data[:, 0].astype(int) if len(gt_points_data) > 0 else np.zeros((0,), dtype=int)
+            gt_pos, gt_ids = extract_detected_point_gt(graph, episode_idx, frame_idx)
             meas_points = graph.x.cpu().numpy()
 
             _, detected_centroids, centroid_to_points = cluster_measurements(meas_points, eps=35, min_samples=3)
 
             # H-GAT-GT
             t0 = time.time()
-            pred_pos_gnn = np.zeros((0, 2), dtype=float)
-            pred_id_gnn = np.zeros((0,), dtype=int)
-            if gnn_model is not None and len(meas_points) > 0:
-                if graph.edge_index.shape[1] > 0:
-                    graph_dev = graph.to(device)
-                    with torch.no_grad():
-                        out = gnn_model(graph_dev)
-                        if isinstance(out, tuple):
-                            offsets = out[1]
-                        else:
-                            offsets = out[1]
-                    corrected_pos = meas_points + offsets.detach().cpu().numpy()
-                else:
-                    corrected_pos = meas_points
-                pred_pos_gnn, pred_id_gnn = gnn_processor.update(corrected_pos)
-            else:
-                pred_pos_gnn, pred_id_gnn = gnn_processor.update(np.empty((0, 2)))
+            corrected_pos = infer_corrected_points(gnn_model, graph, meas_points, device)
+            pred_pos_gnn, pred_id_gnn = gnn_processor.update(corrected_pos)
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
             metrics['H-GAT-GT (Ours)'].update(gt_pos, gt_ids, pred_pos_gnn, pred_id_gnn)
+
+            if enable_meas_diagnostic:
+                t0 = time.time()
+                pred_pos_gnn_meas, pred_id_gnn_meas = gnn_meas_processor.update(meas_points)
+                t1 = time.time()
+                metrics['H-GAT-GT (Meas Ablation)'].update_time(t1 - t0)
+                metrics['H-GAT-GT (Meas Ablation)'].update(gt_pos, gt_ids, pred_pos_gnn_meas, pred_id_gnn_meas)
 
             # Baseline
             t0 = time.time()
@@ -300,14 +339,17 @@ def run_evaluation():
     final_res = {name: metric.compute() for name, metric in metrics.items()}
     df = pd.DataFrame(final_res).T
     cols = [
-        'MOTA', 'MOTP', 'IDSW', 'FAR', 'OSPA (Total)', 'OSPA (Loc)', 'OSPA (Card)',
-        'RMSE (Pos)', 'Count Err', 'Time'
+        'OSPA (Total)', 'OSPA (Loc)', 'OSPA (Card)', 'RMSE (Pos)', 'IDSW', 'Count Err',
+        'MOTA', 'MOTP', 'FAR', 'Time'
     ]
     df = df[[c for c in cols if c in df.columns]]
 
     print('\n' + '=' * 100)
-    print('FINAL 5-WAY POINT-LEVEL RESULTS')
+    print('FINAL POINT-LEVEL RESULTS (DETECTED-ONLY GT)')
     print('=' * 100)
+    print('Note: point-level MOTA is auxiliary under detected-only GT; interpret OSPA / RMSE / IDSW first.')
+    if enable_meas_diagnostic:
+        print('Diagnostic row included: H-GAT-GT (Meas Ablation) tracks raw meas_points to compare against corrected_pos.')
     print(df.to_string())
     print('=' * 100)
 

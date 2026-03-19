@@ -15,20 +15,20 @@ class TrackingMetrics:
         # --- 基础计数 ---
         self.total_frames = 0
         self.total_time_sec = 0.0
-        
+
         # --- MOTA / MOTP 相关 ---
         self.total_misses = 0
-        self.total_fps = 0  
+        self.total_fps = 0
         self.total_id_switches = 0
         self.total_gt_objects = 0
         self.total_dist_error = 0.0
         self.total_matches = 0
-        
+
         # --- OSPA 相关 ---
         self.total_ospa = 0.0
-        self.total_ospa_loc = 0.0 
+        self.total_ospa_loc = 0.0
         self.total_ospa_card = 0.0
-        
+
         # --- 聚类与数量误差 ---
         self.centroid_mse = 0.0
         self.cardinality_error = 0.0
@@ -36,7 +36,7 @@ class TrackingMetrics:
         self.total_purity_score = 0.0
         self.total_completeness_score = 0.0
         self.total_points = 0
-        
+
         self.gt_id_map = {}
 
         # --- G-IoU 相关 ---
@@ -62,21 +62,21 @@ class TrackingMetrics:
             gt_in_cluster = gt_labels[mask]
             if len(gt_in_cluster) > 0:
                 self.total_purity_score += Counter(gt_in_cluster).most_common(1)[0][1]
-        
+
         # Completeness
         for gt_id in np.unique(gt_labels):
             mask = gt_labels == gt_id
             pred_for_gt = pred_labels[mask]
             if len(pred_for_gt) > 0:
                 self.total_completeness_score += Counter(pred_for_gt).most_common(1)[0][1]
-    
+
     # --- 核心修改：实现真正的 Generalized IoU ---
     def _compute_giou(self, box1, box2):
         # box: [cx, cy, w, h]
         # 1. 转换坐标为左上角 (x1, y1) 和 右下角 (x2, y2)
         b1_x1, b1_x2 = box1[0] - box1[2]/2, box1[0] + box1[2]/2
         b1_y1, b1_y2 = box1[1] - box1[3]/2, box1[1] + box1[3]/2
-        
+
         b2_x1, b2_x2 = box2[0] - box2[2]/2, box2[0] + box2[2]/2
         b2_y1, b2_y2 = box2[1] - box2[3]/2, box2[1] + box2[3]/2
 
@@ -103,69 +103,69 @@ class TrackingMetrics:
         c_y1 = min(b1_y1, b2_y1)
         c_x2 = max(b1_x2, b2_x2)
         c_y2 = max(b1_y2, b2_y2)
-        
+
         c_area = (c_x2 - c_x1) * (c_y2 - c_y1) + 1e-6
 
         # 5. G-IoU 公式: IoU - (C - Union) / C
         giou = iou - (c_area - union_area) / c_area
-        
+
         # 限制范围 [-1, 1]
         return max(-1.0, min(1.0, giou))
 
     def update(self, gt_centers, gt_ids, pred_centers, pred_ids, gt_shapes=None, pred_shapes=None):
         self.total_frames += 1
-        
-        if not isinstance(gt_centers, np.ndarray) or gt_centers.ndim != 2: 
+
+        if not isinstance(gt_centers, np.ndarray) or gt_centers.ndim != 2:
             gt_centers = np.array(gt_centers).reshape(-1, 2)
-        if not isinstance(pred_centers, np.ndarray) or pred_centers.ndim != 2: 
+        if not isinstance(pred_centers, np.ndarray) or pred_centers.ndim != 2:
             pred_centers = np.array(pred_centers).reshape(-1, 2)
-        
+
         num_gt = gt_centers.shape[0]
         num_pred = pred_centers.shape[0]
-        
+
         # OSPA 计算
         ospa, ospa_loc, ospa_card = self._compute_ospa_decomposed(gt_centers, pred_centers)
         self.total_ospa += ospa
         self.total_ospa_loc += ospa_loc
         self.total_ospa_card += ospa_card
-        
+
         self.total_gt_objects += num_gt
         self.cardinality_error += abs(num_gt - num_pred)
         self.cardinality_samples += 1
-        
-        if num_gt == 0: 
+
+        if num_gt == 0:
             self.total_fps += num_pred
             return
-        if num_pred == 0: 
+        if num_pred == 0:
             self.total_misses += num_gt
-            return 
-        
+            return
+
         # MOTA 匹配
         dist_matrix = euclidean_distances(gt_centers, pred_centers)
         row_ind, col_ind = linear_sum_assignment(dist_matrix)
-        
+
         matches = []
         for r, c in zip(row_ind, col_ind):
             if dist_matrix[r, c] < self.match_threshold:
                 matches.append((r, c))
-        
+
         self.total_matches += len(matches)
         self.total_misses += (num_gt - len(matches))
         self.total_fps += (num_pred - len(matches))
-        
+
         for r, c in matches:
             dist = dist_matrix[r, c]
             self.total_dist_error += dist
             self.centroid_mse += dist**2
-            
+
             gt_id = gt_ids[r]
             track_id = pred_ids[c]
-            
+
             if gt_id in self.gt_id_map:
                 if self.gt_id_map[gt_id] != track_id:
                     self.total_id_switches += 1
             self.gt_id_map[gt_id] = track_id
-            
+
             # --- G-IoU 计算 ---
             # 只有当形状信息可用时才计算
             if gt_shapes is not None and pred_shapes is not None:
@@ -174,7 +174,7 @@ class TrackingMetrics:
                     # 构造 [cx, cy, w, h]
                     gt_box = [gt_centers[r][0], gt_centers[r][1], gt_shapes[r][0], gt_shapes[r][1]]
                     pred_box = [pred_centers[c][0], pred_centers[c][1], pred_shapes[c][0], pred_shapes[c][1]]
-                    
+
                     self.total_giou += self._compute_giou(gt_box, pred_box)
                     self.giou_matches += 1
 
@@ -182,33 +182,34 @@ class TrackingMetrics:
         m, n = gt.shape[0], pred.shape[0]
         if m == 0 and n == 0: return 0.0, 0.0, 0.0
         if m == 0 or n == 0: return self.ospa_c, 0.0, self.ospa_c
-        
+
         dist_mat = np.minimum(euclidean_distances(gt, pred), self.ospa_c)
         row, col = linear_sum_assignment(dist_mat)
-        
+
         matched_sum = np.sum(dist_mat[row, col] ** self.ospa_p)
         card_penalty = abs(n - m) * (self.ospa_c ** self.ospa_p)
-        
+
         total = (matched_sum + card_penalty) / max(m, n)
-        
+
         return total**(1/self.ospa_p), (matched_sum/max(m,n))**(1/self.ospa_p), (card_penalty/max(m,n))**(1/self.ospa_p)
 
     def compute(self):
         frames = max(1, self.total_frames)
         gt_objs = max(1, self.total_gt_objects)
-        matches = max(1, self.total_matches)
         points = max(1, self.total_points)
-        
+        has_matches = self.total_matches > 0
+
         mota = 1.0 - (self.total_misses + self.total_fps + self.total_id_switches) / gt_objs
-        motp = self.total_dist_error / matches if matches > 0 else 0.0
-        
+        motp = self.total_dist_error / self.total_matches if has_matches else np.nan
+        rmse = np.sqrt(self.centroid_mse / self.total_matches) if has_matches else np.nan
+
         return {
             "MOTA": mota,
             "MOTP": motp,
             "OSPA (Total)": self.total_ospa / frames,
             "OSPA (Loc)": self.total_ospa_loc / frames,
             "OSPA (Card)": self.total_ospa_card / frames,
-            "RMSE (Pos)": np.sqrt(self.centroid_mse / matches) if matches > 0 else 0.0,
+            "RMSE (Pos)": rmse,
             "IDSW": self.total_id_switches,
             "FAR": self.total_fps / frames,
             "Count Err": self.cardinality_error / max(1, self.cardinality_samples),
