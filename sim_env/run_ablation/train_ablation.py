@@ -1,108 +1,178 @@
 import os
 import sys
+
 import torch
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
-import json
-import random
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SIM_ENV_DIR = os.path.dirname(CURRENT_DIR)
+PROJECT_ROOT = os.path.dirname(SIM_ENV_DIR)
+for path in (PROJECT_ROOT, SIM_ENV_DIR):
+    if path not in sys.path:
+        sys.path.append(path)
+
 import config
-from dataset import RadarFileDataset
 from run_ablation.ablation_model import AblationGNNTracker
-from train_sim import compute_loss
+from sim_env.dataset import RadarFileDataset
+from sim_env.train_sim import compute_frame_loss
+
+
+ABLATION_EPOCHS = 10
+TRAIN_SUBSET_SIZE = 500
+
+
+def infer_input_dims(dataset):
+    for episode in dataset:
+        for graph in episode:
+            if graph.x.shape[0] == 0:
+                continue
+            node_dim = graph.x.shape[1]
+            edge_dim = graph.edge_attr.shape[1] if graph.edge_attr.dim() == 2 else config.EDGE_DIM
+            return node_dim, edge_dim
+    return config.INPUT_DIM, config.EDGE_DIM
+
+
+def build_loader(dataset, shuffle=False, subset_size=None):
+    if subset_size is not None:
+        indices = list(range(min(len(dataset), subset_size)))
+        dataset = torch.utils.data.Subset(dataset, indices)
+    return DataLoader(dataset, batch_size=1, shuffle=shuffle, collate_fn=lambda x: x[0], num_workers=0)
+
+
+def checkpoint_path(name):
+    return os.path.join(PROJECT_ROOT, 'sim_env', 'run_ablation', 'model', f'model_{name}.pth')
+
+
+def run_epoch(model, loader, device, optimizer=None, desc='Train'):
+    is_train = optimizer is not None
+    if is_train:
+        model.train()
+        grad_context = torch.enable_grad()
+    else:
+        model.eval()
+        grad_context = torch.no_grad()
+
+    total_loss = 0.0
+    frame_count = 0
+    components = {'edge': 0.0, 'group': 0.0, 'point': 0.0, 'temp': 0.0}
+
+    with grad_context:
+        pbar = tqdm(loader, desc=desc, leave=False)
+        for episode_graphs in pbar:
+            prev_point_state = {}
+            for graph in episode_graphs:
+                graph = graph.to(device)
+                if graph.x.shape[0] == 0 or graph.edge_index.shape[1] == 0:
+                    prev_point_state = {}
+                    continue
+
+                outputs = model(graph)
+                loss, stats, prev_point_state = compute_frame_loss(outputs, graph, prev_point_state)
+                if torch.isnan(loss) or torch.isinf(loss):
+                    prev_point_state = {}
+                    continue
+
+                if is_train:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                total_loss += stats['total']
+                for key in components:
+                    components[key] += stats[key]
+                frame_count += 1
+
+            if frame_count > 0:
+                pbar.set_postfix({
+                    'loss': f'{total_loss / frame_count:.4f}',
+                    'group': f'{components["group"] / frame_count:.4f}',
+                    'point': f'{components["point"] / frame_count:.4f}',
+                    'temp': f'{components["temp"] / frame_count:.4f}',
+                })
+
+    avg_loss = total_loss / max(1, frame_count)
+    avg_components = {key: value / max(1, frame_count) for key, value in components.items()}
+    return avg_loss, avg_components
+
 
 def run_experiment(name, model_config, skip_train=False):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n>>> Running {name} on {device}")
-    
-    val_set = RadarFileDataset('val')
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, collate_fn=lambda x: x[0])
-
-    if skip_train:
-        return 0.42 # 占位符
+    device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
+    print(f'\n>>> Running {name} on {device}')
 
     train_set = RadarFileDataset('train')
-    # 加速：仅使用前 500 个样本进行消融，减少训练时间
-    train_indices = list(range(min(len(train_set), 500)))
-    train_loader = DataLoader(torch.utils.data.Subset(train_set, train_indices), 
-                              batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
-    
-    input_node_dim, input_edge_dim = config.INPUT_DIM, config.EDGE_DIM
-    for episode in val_set:
-        valid_graphs = [g for g in episode if g.edge_index.shape[1] > 0]
-        if valid_graphs:
-            input_node_dim = valid_graphs[0].x.shape[1]
-            input_edge_dim = valid_graphs[0].edge_attr.shape[1]
-            break
-            
-    model = AblationGNNTracker(**model_config, input_node_dim=input_node_dim, input_edge_dim=input_edge_dim).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-    
+    val_set = RadarFileDataset('val')
+    input_node_dim, input_edge_dim = infer_input_dims(val_set if len(val_set) > 0 else train_set)
+
+    model = AblationGNNTracker(
+        **model_config,
+        input_node_dim=input_node_dim,
+        input_edge_dim=input_edge_dim,
+        hidden_dim=config.HIDDEN_DIM,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-4)
+
+    ckpt_path = checkpoint_path(name)
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+
+    if skip_train:
+        print(f'Skip training for {name}; expected checkpoint: {ckpt_path}')
+        return None
+
+    train_loader = build_loader(train_set, shuffle=True, subset_size=TRAIN_SUBSET_SIZE)
+    val_loader = build_loader(val_set, shuffle=False)
+
     best_val_loss = float('inf')
-    history = {'train_loss': [], 'val_loss': []}
-    
-    # 消融实验跑 10 个 Epoch 足够看出性能差异
-    for epoch in range(10):
-        model.train()
-        train_l, count = 0, 0
-        pbar = tqdm(train_loader, desc=f"{name} Ep {epoch}")
-        for episode in pbar:
-            for graph in episode:
-                if graph.x.shape[0] <= 1: continue
-                graph = graph.to(device)
-                
-                scores, offsets, uncertainty, _ = model(graph)
-                loss, _, _ = compute_loss(scores, offsets, uncertainty, graph)
-                
-                if torch.isnan(loss) or torch.isinf(loss): continue
-                
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                train_l += loss.item()
-                count += 1
-            if count > 0: pbar.set_postfix({'loss': f"{train_l/count:.4f}"})
-        
-        # 验证
-        model.eval()
-        v_l, v_c = 0, 0
-        with torch.no_grad():
-            for episode in val_loader:
-                for graph in episode:
-                    if graph.x.shape[0] <= 1: continue
-                    graph = graph.to(device)
-                    scores, offsets, uncertainty, _ = model(graph)
-                    loss, _, _ = compute_loss(scores, offsets, uncertainty, graph)
-                    if not torch.isnan(loss):
-                        v_l += loss.item()
-                        v_c += 1
-        
-        avg_train = train_l / count if count > 0 else 0
-        avg_val = v_l / v_c if v_c > 0 else float('inf')
-        
-        history['train_loss'].append(avg_train)
-        history['val_loss'].append(avg_val)
-        print(f"Epoch {epoch}: Train={avg_train:.4f}, Val={avg_val:.4f}")
-        
-        if avg_val < best_val_loss and not torch.isnan(torch.tensor(avg_val)):
-            best_val_loss = avg_val
-            torch.save(model.state_dict(), f"sim_env/run_ablation/model/model_{name}_v2.pth")
+    for epoch in range(ABLATION_EPOCHS):
+        train_loss, train_components = run_epoch(
+            model,
+            train_loader,
+            device,
+            optimizer=optimizer,
+            desc=f'{name} Epoch {epoch + 1}/{ABLATION_EPOCHS} [Train]',
+        )
+        val_loss, val_components = run_epoch(
+            model,
+            val_loader,
+            device,
+            optimizer=None,
+            desc=f'{name} Epoch {epoch + 1}/{ABLATION_EPOCHS} [Val]',
+        )
+
+        print(
+            f'Epoch {epoch + 1}: '
+            f'Train={train_loss:.4f} '
+            f'(group={train_components["group"]:.4f}, point={train_components["point"]:.4f}, temp={train_components["temp"]:.4f}) | '
+            f'Val={val_loss:.4f} '
+            f'(group={val_components["group"]:.4f}, point={val_components["point"]:.4f}, temp={val_components["temp"]:.4f})'
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), ckpt_path)
+            print(f'  >>> Best model saved to {ckpt_path}')
+
     return best_val_loss
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     experiments = {
-        "model_No_Adaptive_Fusion": {"use_fourier": True, "fusion_mode": 'last', "use_transformer": True}
+        'No_Fourier': {'use_fourier': False, 'fusion_mode': 'adaptive', 'use_transformer': True},
+        'No_Adaptive_Fusion': {'use_fourier': True, 'fusion_mode': 'last', 'use_transformer': True},
+        'Plain_GCN': {'use_fourier': True, 'fusion_mode': 'adaptive', 'use_transformer': False},
     }
-    #    想训练哪个就改这里
-    #   "Plain_GCN": {"use_fourier": True, "fusion_mode": 'adaptive', "use_transformer": False}
-    #   "model_No_Fourier": {"use_fourier": False, "fusion_mode": 'adaptive', "use_transformer": True}
-    #   "model_No_Adaptive_Fusion": {"use_fourier": True, "fusion_mode": 'last', "use_transformer": True}
-    summary = {"Full_Model": 0.385, "No_Fourier": 0.452, "No_Adaptive_Fusion": 0.418} # 这里的数值你可以根据已有的结果填一下
-    os.makedirs('sim_env/run_ablation/output/result', exist_ok=True)
+
+    summary = {}
     for name, cfg in experiments.items():
         summary[name] = run_experiment(name, cfg)
-    
-    print("\n" + "="*40 + "\nSummary (Best Val Loss):\n" + "\n".join([f"{k:<25}: {v:.4f}" for k, v in summary.items()]) + "\n" + "="*40)
+
+    print('\n' + '=' * 48)
+    print('Ablation Summary (Best Val Loss)')
+    print('=' * 48)
+    for name, value in summary.items():
+        if value is None:
+            print(f'{name:<24}: skipped')
+        else:
+            print(f'{name:<24}: {value:.4f}')
+    print('=' * 48)

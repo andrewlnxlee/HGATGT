@@ -13,9 +13,9 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 import config
-from model import GNNGroupTracker  # 确保这里导入的是主模型
 from run_ablation.ablation_model import AblationGNNTracker
-from dataset import RadarFileDataset
+from sim_env.dataset import RadarFileDataset
+from sim_env.model import GNNGroupTracker
 from metrics import TrackingMetrics
 from trackers.gnn_processor import GNNPostProcessor
 
