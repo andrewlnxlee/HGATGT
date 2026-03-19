@@ -442,6 +442,7 @@ def run_evaluation():
     print('=' * 100)
     print('Note: point-level MOTA is auxiliary under detected-only GT; interpret OSPA / RMSE / IDSW first.')
     print(f'Prediction-side point filtering: DBSCAN eps={POINT_CLUSTER_EPS}, min_samples={POINT_CLUSTER_MIN_SAMPLES}; only non-noise points enter point tracking.')
+    print(f'Point tracker thresholds: stage1={POINT_TRACK_STAGE1_THRESHOLD}, recovery={POINT_TRACK_RECOVERY_THRESHOLD}, max_age={POINT_TRACK_MAX_AGE}, metric_match={POINT_MATCH_THRESHOLD}.')
     if enable_meas_diagnostic:
         print('Diagnostic row included: H-GAT-GT (Meas Ablation) tracks filtered raw meas_points to compare against corrected_pos.')
     if enable_uncertainty_ablation:
