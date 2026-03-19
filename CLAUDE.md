@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 各种对比算法都在 `trackers/` 下，场景级评估入口分别是 `sim_env/evaluate.py` 和 `ewap_env/evaluate_ewap.py`。
 - 写好代码后**不要在本地执行训练/评估/可视化命令**；本地环境不可用，由用户上传到服务器运行。
 - 仓库里**没有** repo 级统一构建/测试配置；不要臆造 lint/test 命令。
-
+- 若打算了解各个版本的修改信息，请参考 `各个版本修改信息/` 。
 
 ## 架构总览
 
