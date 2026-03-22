@@ -8,15 +8,16 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.colors as mcolors
 from matplotlib.patches import Polygon
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import ConvexHull, QhullError
+from sklearn.cluster import DBSCAN
 from sklearn.metrics import accuracy_score
+from sklearn.metrics.pairwise import euclidean_distances
 
 import config
 from model import GNNGroupTracker
 from dataset import RadarFileDataset
+from trackers.gnn_processor import GNNPostProcessor
 
 
 NUM = 6  # 选择第几个样本 episode
@@ -67,145 +68,20 @@ COLOR_PALETTE = [
 ]
 
 
-# ==========================================
-# 1. 升级版跟踪器: 匈牙利匹配 + 速度预测
-# ==========================================
-class RobustGroupTracker:
-    def __init__(self, max_age=5, dist_thresh=60.0):
-        self.tracks = {}  # {id: {'pos': [x,y], 'vel': [vx,vy], 'age': 0, 'trace': []}}
-        self.next_id = 1
-        self.max_age = max_age
-        self.dist_thresh = dist_thresh
+def unpack_group_offsets(model_out):
+    if hasattr(model_out, 'get_offsets'):
+        return model_out.get_offsets('group')
+    if isinstance(model_out, (tuple, list)) and len(model_out) >= 2:
+        return model_out[1]
+    raise ValueError('模型输出缺少 group offset。')
 
-    def update(self, detected_centers):
-        """
-        detected_centers: 当前帧 GNN 聚类出的质心列表 [[x,y], ...]
-        返回: {detection_idx: track_id}
-        """
-        # --- 1. 状态预测 (Predict) ---
-        for tid, trk in self.tracks.items():
-            trk['pos'] += trk['vel']
-            trk['age'] += 1
 
-        active_track_ids = list(self.tracks.keys())
-        num_tracks = len(active_track_ids)
-        num_dets = len(detected_centers)
-
-        assignment = {}
-        used_dets = set()
-        used_tracks = set()
-
-        # --- 2. 构建代价矩阵 (Cost Matrix) ---
-        if num_tracks > 0 and num_dets > 0:
-            cost_matrix = np.zeros((num_tracks, num_dets))
-            for i, tid in enumerate(active_track_ids):
-                pred_pos = self.tracks[tid]['pos']
-                for j, det_pos in enumerate(detected_centers):
-                    cost_matrix[i, j] = np.linalg.norm(pred_pos - det_pos)
-
-            # --- 3. 匈牙利算法匹配 (Global Optimization) ---
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-            # --- 4. 过滤不合理的匹配 ---
-            for r, c in zip(row_ind, col_ind):
-                if cost_matrix[r, c] < self.dist_thresh:
-                    tid = active_track_ids[r]
-                    self._update_track_state(tid, detected_centers[c])
-                    assignment[c] = tid
-                    used_tracks.add(tid)
-                    used_dets.add(c)
-
-        # =========================================
-        #   特殊事件处理：分裂与合并
-        # =========================================
-
-        # --- 检查分裂 (Split) ---
-        for d_idx in range(num_dets):
-            if d_idx in used_dets:
-                continue
-
-            det_pos = detected_centers[d_idx]
-            best_dist = float('inf')
-            parent_id = -1
-
-            for tid in self.tracks:
-                dist = np.linalg.norm(self.tracks[tid]['pos'] - det_pos)
-                if dist < self.dist_thresh and dist < best_dist:
-                    best_dist = dist
-                    parent_id = tid
-
-            if parent_id != -1:
-                new_id = self.next_id
-                self.next_id += 1
-                self._create_track(new_id, det_pos, parent_vel=self.tracks[parent_id]['vel'])
-                assignment[d_idx] = new_id
-                used_dets.add(d_idx)
-
-        # --- 检查合并 (Merge) ---
-        for tid in active_track_ids:
-            if tid in used_tracks:
-                continue
-
-            track_pos = self.tracks[tid]['pos']
-            best_dist = float('inf')
-            target_det_idx = -1
-
-            for d_idx in range(num_dets):
-                dist = np.linalg.norm(track_pos - detected_centers[d_idx])
-                if dist < self.dist_thresh and dist < best_dist:
-                    best_dist = dist
-                    target_det_idx = d_idx
-
-            if target_det_idx != -1:
-                used_tracks.add(tid)
-
-        # --- 处理新生目标 (New Birth) ---
-        for d_idx in range(num_dets):
-            if d_idx not in used_dets:
-                new_id = self.next_id
-                self.next_id += 1
-                self._create_track(new_id, detected_centers[d_idx])
-                assignment[d_idx] = new_id
-
-        # --- 清理死亡目标 (Dead Tracks) ---
-        to_delete = []
-        for tid in self.tracks:
-            if tid not in used_tracks and self.tracks[tid]['age'] > self.max_age:
-                to_delete.append(tid)
-
-        for tid in to_delete:
-            del self.tracks[tid]
-
-        return assignment
-
-    def _create_track(self, tid, pos, parent_vel=None):
-        vel = parent_vel.copy() if parent_vel is not None else np.zeros(2)
-        self.tracks[tid] = {
-            'pos': np.array(pos),
-            'vel': np.array(vel),
-            'age': 0,
-            'trace': [np.array(pos)]
-        }
-
-    def _update_track_state(self, tid, curr_pos):
-        alpha_pos = 0.6
-        alpha_vel = 0.3
-
-        prev_pos = self.tracks[tid]['pos']
-        prev_vel = self.tracks[tid]['vel']
-
-        inst_vel = curr_pos - prev_pos
-
-        new_pos = prev_pos * (1 - alpha_pos) + curr_pos * alpha_pos
-        new_vel = prev_vel * (1 - alpha_vel) + inst_vel * alpha_vel
-
-        self.tracks[tid]['pos'] = new_pos
-        self.tracks[tid]['vel'] = new_vel
-        self.tracks[tid]['age'] = 0
-
-        self.tracks[tid]['trace'].append(new_pos)
-        if len(self.tracks[tid]['trace']) > 50:
-            self.tracks[tid]['trace'].pop(0)
+def unpack_edge_scores(model_out):
+    if hasattr(model_out, 'edge_scores'):
+        return model_out.edge_scores
+    if isinstance(model_out, (tuple, list)) and len(model_out) >= 1:
+        return model_out[0]
+    return None
 
 
 def get_track_color(track_id):
@@ -311,110 +187,170 @@ def draw_fading_trail(ax, trace, color):
         )
 
 
+def build_gnn_detections(raw_pos, corrected_pos):
+    if len(corrected_pos) == 0:
+        return np.empty((0, 2)), None, []
+
+    try:
+        labels = DBSCAN(eps=30, min_samples=3).fit(corrected_pos).labels_
+    except Exception:
+        labels = np.full(len(corrected_pos), -1)
+
+    det_centers = []
+    det_shapes = []
+    cluster_indices_list = []
+
+    for label in set(labels):
+        if label == -1:
+            continue
+        indices = np.where(labels == label)[0]
+        cluster_indices_list.append(indices)
+
+        det_centers.append(np.mean(corrected_pos[indices], axis=0))
+
+        pts_raw = raw_pos[indices]
+        if len(pts_raw) > 1:
+            lower = np.percentile(pts_raw, 5, axis=0)
+            upper = np.percentile(pts_raw, 95, axis=0)
+            wh = upper - lower
+        else:
+            wh = np.array([0.0, 0.0])
+        det_shapes.append(np.maximum(wh, 3.0))
+
+    det_centers = np.array(det_centers).reshape(-1, 2)
+    det_shapes = np.array(det_shapes).reshape(-1, 2)
+    if len(det_shapes) == 0:
+        det_shapes = None
+
+    return det_centers, det_shapes, cluster_indices_list
+
+
+def assign_tracks_to_points(pred_centers, pred_track_ids, det_centers, cluster_indices_list, num_nodes):
+    point_track_ids = np.full(num_nodes, -1, dtype=int)
+    centers = {}
+    matched_track_ids = set()
+
+    if len(pred_centers) == 0 or len(det_centers) == 0:
+        return point_track_ids, centers, matched_track_ids
+
+    cost_matrix = euclidean_distances(pred_centers, det_centers)
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    for r, c in zip(row_ind, col_ind):
+        if cost_matrix[r, c] < 20.0:
+            track_id = int(pred_track_ids[r])
+            point_indices = cluster_indices_list[c]
+            point_track_ids[point_indices] = track_id
+            centers[track_id] = pred_centers[r]
+            matched_track_ids.add(track_id)
+
+    return point_track_ids, centers, matched_track_ids
+
+
+def compute_edge_accuracy(edge_scores, graph):
+    if edge_scores is None or not hasattr(graph, 'edge_label'):
+        return 0.0
+    if graph.edge_label.numel() == 0:
+        return 0.0
+
+    preds = (edge_scores > 0.5).float()
+    return accuracy_score(
+        graph.edge_label.detach().cpu().numpy(),
+        preds.detach().cpu().numpy(),
+    )
+
+
 # ==========================================
-# 2. 推理主流程 (带 Accuracy 计算)
+# 推理主流程（与 evaluate.py 主线对齐）
 # ==========================================
 def run_inference_and_viz():
     device = torch.device(config.DEVICE)
 
-    model = GNNGroupTracker().to(device)
+    model = GNNGroupTracker(
+        input_node_dim=config.INPUT_DIM,
+        input_edge_dim=config.EDGE_DIM,
+        hidden_dim=config.HIDDEN_DIM,
+    ).to(device)
     if not os.path.exists(config.MODEL_USE_PATH):
-        print("Model not found! Train first.")
+        print('Model not found! Train first.')
         return
     model.load_state_dict(torch.load(config.MODEL_USE_PATH, map_location=device))
     model.eval()
 
     test_set = RadarFileDataset('test')
     if len(test_set) == 0:
-        print("Test set empty. Run generate_data.py.")
+        print('Test set empty. Run generate_data.py.')
         return
     episode_graphs = test_set.get(NUM)
 
-    tracker = RobustGroupTracker(dist_thresh=50.0)
+    gnn_processor = GNNPostProcessor()
 
     viz_frames = []
-    print(f"Starting inference on {len(episode_graphs)} frames...")
+    print(f'Starting inference on {len(episode_graphs)} frames...')
 
     with torch.no_grad():
         for t, graph in enumerate(episode_graphs):
-            graph = graph.to(device)
-            raw_pos = graph.x.cpu().numpy()
+            graph_dev = graph.to(device)
+            raw_pos = graph.x.detach().cpu().numpy()
+            num_nodes = len(raw_pos)
 
-            if graph.edge_index.shape[1] == 0:
-                viz_frames.append({
-                    'raw_pos': raw_pos,
-                    'plot_pos': raw_pos.copy(),
-                    'track_ids': np.full(graph.num_nodes, -1),
-                    'centers': {},
-                    'acc': 0.0,
-                    'trace': {}
-                })
-                continue
-
-            # --- Model Forward ---
-            scores, offsets, _ = model(graph)
-
-            # --- Calculate Accuracy ---
-            preds = (scores > 0.5).float()
-            edge_acc = accuracy_score(graph.edge_label.cpu().numpy(), preds.cpu().numpy())
-
-            # --- Clustering ---
-            mask = scores > 0.5
-            edges = graph.edge_index[:, mask].cpu().numpy()
-            num_nodes = graph.num_nodes
-
-            if edges.shape[1] > 0:
-                adj = coo_matrix((np.ones(edges.shape[1]), (edges[0], edges[1])), shape=(num_nodes, num_nodes))
-                n_comps, labels = connected_components(adj, directed=False)
-            else:
-                n_comps = num_nodes
-                labels = np.arange(num_nodes)
-
-            # --- Extract Centroids ---
-            offsets_np = offsets.cpu().numpy()
-            corrected_pos = raw_pos + offsets_np
-
-            clusters_centers = []
-            cluster_id_map = []
-
-            for cid in range(n_comps):
-                idx = np.where(labels == cid)[0]
-                if len(idx) < 3:
-                    continue
-                center = np.mean(corrected_pos[idx], axis=0)
-                clusters_centers.append(center)
-                cluster_id_map.append(cid)
-
-            # --- Tracking ---
-            assignment = tracker.update(clusters_centers)
-
-            # --- Prepare Viz Data ---
             frame_data = {
                 'raw_pos': raw_pos,
-                'plot_pos': corrected_pos,
-                'track_ids': np.full(num_nodes, -1),
+                'plot_pos': raw_pos.copy(),
+                'track_ids': np.full(num_nodes, -1, dtype=int),
                 'centers': {},
-                'acc': edge_acc,
-                'trace': {}
+                'acc': 0.0,
+                'trace': {},
             }
 
-            for det_idx, track_id in assignment.items():
-                original_cid = cluster_id_map[det_idx]
-                idx = np.where(labels == original_cid)[0]
-                frame_data['track_ids'][idx] = track_id
-                frame_data['centers'][track_id] = clusters_centers[det_idx]
-                frame_data['trace'][track_id] = np.array(tracker.tracks[track_id]['trace'])
+            if num_nodes == 0:
+                gnn_processor.update(np.empty((0, 2)), None)
+                viz_frames.append(frame_data)
+                print(f'Frame {t:02d} | Edge Acc: 0.00% | Active Tracks: 0')
+                continue
+
+            model_out = model(graph_dev)
+            edge_scores = unpack_edge_scores(model_out)
+            group_offsets = unpack_group_offsets(model_out)
+            frame_data['acc'] = compute_edge_accuracy(edge_scores, graph_dev)
+
+            corrected_pos = raw_pos + group_offsets.detach().cpu().numpy()
+            frame_data['plot_pos'] = corrected_pos
+
+            det_centers, det_shapes, cluster_indices_list = build_gnn_detections(raw_pos, corrected_pos)
+
+            if len(det_centers) > 0:
+                pred_centers, pred_track_ids, _ = gnn_processor.update(det_centers, det_shapes)
+            else:
+                pred_centers, pred_track_ids, _ = gnn_processor.update(np.empty((0, 2)), None)
+
+            pred_centers = np.array(pred_centers).reshape(-1, 2)
+            pred_track_ids = np.array(pred_track_ids).reshape(-1)
+
+            point_track_ids, centers, matched_track_ids = assign_tracks_to_points(
+                pred_centers,
+                pred_track_ids,
+                det_centers,
+                cluster_indices_list,
+                num_nodes,
+            )
+
+            frame_data['track_ids'] = point_track_ids
+            frame_data['centers'] = centers
+            for track_id in matched_track_ids:
+                if track_id in gnn_processor.tracks:
+                    frame_data['trace'][track_id] = np.array(gnn_processor.tracks[track_id]['trace'])
 
             viz_frames.append(frame_data)
-            print(f"Frame {t:02d} | Edge Acc: {edge_acc * 100:.2f}% | Active Tracks: {len(assignment)}")
+            print(f"Frame {t:02d} | Edge Acc: {frame_data['acc'] * 100:.2f}% | Active Tracks: {len(frame_data['centers'])}")
 
     if not viz_frames:
-        print("No frames to visualize.")
+        print('No frames to visualize.')
         return
 
     xlim, ylim = compute_scene_limits(viz_frames)
 
-    print("Generating GIF...")
+    print('Generating GIF...')
     fig, ax = plt.subplots(figsize=VIZ_STYLE['figsize'], dpi=VIZ_STYLE['dpi'])
     fig.patch.set_facecolor(VIZ_STYLE['background'])
     fig.subplots_adjust(left=0.11, right=0.97, bottom=0.10, top=0.92)
@@ -501,7 +437,7 @@ def run_inference_and_viz():
                 offset = (10, 9) if int(uid) % 2 else (10, -16)
                 va = 'bottom' if int(uid) % 2 else 'top'
                 ax.annotate(
-                    f"G{int(uid)}",
+                    f'G{int(uid)}',
                     xy=(cx, cy),
                     xytext=offset,
                     textcoords='offset points',
@@ -520,9 +456,9 @@ def run_inference_and_viz():
                 )
 
         info_text = (
-            f"Frame {frame_idx:02d}\n"
-            f"Active groups  {len(data['centers'])}\n"
-            f"Edge acc  {data['acc'] * 100:5.1f}%"
+            f'Frame {frame_idx:02d}\n'
+            f'Active groups  {len(data["centers"])}\n'
+            f'Edge acc  {data["acc"] * 100:5.1f}%'
         )
         ax.text(
             0.02, 0.98, info_text,
@@ -543,12 +479,12 @@ def run_inference_and_viz():
         ax.set_ylabel('Y (m)', fontsize=10, color=VIZ_STYLE['tick_color'])
 
     os.makedirs(config.OUTPUT_GIF_DIR, exist_ok=True)
-    path2 = os.path.join(config.OUTPUT_GIF_DIR, f"sim_data_{NUM}_track_result_paper.gif")
-    ani = animation.FuncAnimation(fig, update, frames=len(viz_frames), interval=1000 // VIZ_STYLE['fps'])
+    path2 = os.path.join(config.OUTPUT_GIF_DIR, f'sim_data_{NUM}_track_result_paper.gif')
+    ani = animation.FuncAnimation(fig, update, frames=len(viz_frames), interval=max(1, 1000 // VIZ_STYLE['fps']))
     ani.save(path2, writer='pillow', fps=VIZ_STYLE['fps'], dpi=VIZ_STYLE['dpi'])
     plt.close(fig)
-    print(f"Saved {path2}")
+    print(f'Saved {path2}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_inference_and_viz()
