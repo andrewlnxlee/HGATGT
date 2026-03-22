@@ -39,6 +39,11 @@ VIZ_STYLE = {
     'group_point_size': 44,
     'group_edge_width': 0.85,
     'group_edge_color': '#ffffff',
+    'raw_group_size': 30,
+    'raw_group_alpha': 0.42,
+    'raw_group_edge_width': 1.15,
+    'offset_line_alpha': 0.26,
+    'offset_line_width': 0.9,
     'region_alpha': 0.14,
     'region_edge_alpha': 0.46,
     'region_edge_width': 1.2,
@@ -438,12 +443,31 @@ def run_inference_and_viz():
         for uid in unique_ids:
             mask = track_ids == uid
             color = get_track_color(uid)
+            raw_group_points = raw_pos[mask]
             group_points = plot_pos[mask]
 
             draw_group_region(ax, group_points, color)
 
             if uid in data['trace']:
                 draw_fading_trail(ax, data['trace'][uid], color)
+
+            if len(raw_group_points):
+                for raw_pt, fused_pt in zip(raw_group_points, group_points):
+                    ax.plot(
+                        [raw_pt[0], fused_pt[0]], [raw_pt[1], fused_pt[1]],
+                        color=mcolors.to_rgba(color, VIZ_STYLE['offset_line_alpha']),
+                        linewidth=VIZ_STYLE['offset_line_width'],
+                        zorder=2,
+                    )
+
+                ax.scatter(
+                    raw_group_points[:, 0], raw_group_points[:, 1],
+                    facecolors='none',
+                    edgecolors=mcolors.to_rgba(color, VIZ_STYLE['raw_group_alpha']),
+                    s=VIZ_STYLE['raw_group_size'],
+                    linewidths=VIZ_STYLE['raw_group_edge_width'],
+                    zorder=4,
+                )
 
             ax.scatter(
                 group_points[:, 0], group_points[:, 1],
