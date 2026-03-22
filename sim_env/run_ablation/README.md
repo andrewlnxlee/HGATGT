@@ -9,18 +9,20 @@
 ```
 run_ablation/
 ├── ablation_model.py          # 可配置的消融模型定义
-├── dataset.py                 # 数据集加载器（基于 PyG Data）
+├── dataset.py                 # 数据集加载器重导出（实际逻辑在 sim_env/dataset.py）
 ├── train_ablation.py          # 消融变体训练脚本
-├── run_comparison.py          # 全模型与消融变体的统一评估对比脚本
-├── model/                     # 保存的模型权重
+├── run_comparison.py          # 全模型与消融变体的统一评估对比脚本（群组级）
+├── run_point_comparison.py    # 全模型与消融变体的统一评估对比脚本（点级）
+├── model/                     # 当前标准命名权重与部分历史遗留权重并存
 │   ├── model_No_Fourier.pth
-│   ├── model_No_Fourier_v2.pth
+│   ├── model_model_No_Fourier_v2.pth
 │   ├── model_No_Adaptive_Fusion.pth
 │   ├── model_model_No_Adaptive_Fusion_v2.pth
 │   ├── model_Plain_GCN.pth
 │   └── model_Plain_GCN_v2.pth
-├── output/result/             # 实验结果输出
+├── output/result/             # 群组级 / 点级消融结果输出
 │   ├── ablation_comparison_final.csv
+│   ├── ablation_point_comparison.csv
 │   └── 实验结果.md
 └── README.md                  # 本文件
 ```
@@ -38,8 +40,8 @@ run_ablation/
 | 属性 | 说明 |
 |---|---|
 | 作用 | 将低维位置坐标 (x, y) 通过随机傅里叶特征映射到高维空间，增强模型对空间位置的感知能力 |
-| 输入维度 | 2（x, y 坐标） |
-| 映射维度 | `mapping_size=32`，输出为 `2 * 32 = 64` 维（sin 和 cos 各 32 维） |
+| 输入维度 | 当前仿真消融实验中为 2（x, y 坐标） |
+| 映射维度 | 实际使用时 `mapping_size=32`，输出为 `2 * 32 = 64` 维（sin 和 cos 各 32 维） |
 | 缩放因子 | `scale=2.0`，控制随机高斯矩阵 B 的标准差 |
 | 原理 | 利用随机傅里叶特征（Random Fourier Features）近似高斯核函数，将二维坐标投影到高维空间：`output = [sin(2π·x·B), cos(2π·x·B)]` |
 | 关键实现 | 矩阵 B 通过 `register_buffer` 注册为非训练参数（固定不变），保证编码的一致性 |
@@ -63,7 +65,7 @@ run_ablation/
 | `use_fourier` | `True` | 是否启用傅里叶特征编码 |
 | `fusion_mode` | `'adaptive'` | 层融合方式：`'adaptive'`（自适应加权）或 `'last'`（仅用最后一层） |
 | `use_transformer` | `True` | 是否使用 TransformerConv；`False` 则退化为 GCNConv |
-| `hidden_dim` | `96` | 隐层维度 |
+| `hidden_dim` | 跟随 `config.HIDDEN_DIM`（当前 `sim_env/config.py` 为 64） | 隐层维度 |
 | `input_node_dim` | `config.INPUT_DIM` (2) | 节点输入特征维度 |
 | `input_edge_dim` | `config.EDGE_DIM` (3) | 边输入特征维度 |
 
@@ -72,7 +74,8 @@ run_ablation/
 ```
 输入 graph(x, edge_index, edge_attr)
     │
-    ├─ [若 use_fourier=True] x_pos = x[:, :2] → FourierFeatureEncoder → 64维
+    ├─ [若 use_fourier=True] x（当前仿真输入即 2D [x, y]）
+    │   → FourierFeatureEncoder → 64维
     │   → concat(x, fourier_features) → node_mlp → h (hidden_dim 维)
     │
     ├─ [若 use_fourier=False] x → node_mlp → h (hidden_dim 维)
@@ -80,7 +83,7 @@ run_ablation/
     ├─ edge_attr → edge_encoder → e (hidden_dim 维)
     │
     ├─ 4层 GNN 卷积（TransformerConv 或 GCNConv）
-    │   每层: conv → GELU → LayerNorm → 残差连接
+    │   每层: conv → BatchNorm → GELU → 残差连接
     │   收集每层输出 → layers[]
     │
     ├─ [若 fusion='adaptive'] AdaptiveLayerFusion(layers) → h_final
@@ -88,20 +91,23 @@ run_ablation/
     │
     ├─ 边分类头: concat(h_final[src], h_final[dst], e) → MLP → Sigmoid → edge_scores
     │
-    └─ 偏移回归头: h_final → MLP → [pred_offsets (2维, clamp ±100),
-                                       pred_uncertainty (2维, softplus, clamp [0.01, 10])]
+    ├─ 群级偏移头: h_final → MLP → [group_offsets (2维),
+    │                               group_uncertainty (2维, softplus + 1e-6)]
+    │
+    └─ 点级偏移头: h_final → MLP → [point_offsets (2维),
+                                    point_uncertainty (2维, softplus + 1e-6)]
 ```
 
-**输出：** `(edge_scores, pred_offsets, pred_uncertainty, h_final)`
+**输出：** `TrackerOutputs(edge_scores, group_offsets, group_uncertainty, point_offsets, point_uncertainty)`
 - `edge_scores`：每条边属于同一目标群组的概率
-- `pred_offsets`：每个节点到其所属群组中心的位移预测
-- `pred_uncertainty`：每个节点预测的不确定性（异方差回归）
-- `h_final`：节点最终嵌入表征
+- `group_offsets` / `group_uncertainty`：群级中心偏移预测及其不确定性
+- `point_offsets` / `point_uncertainty`：点级 member 偏移预测及其不确定性
 
 **关键细节：**
 - TransformerConv 使用 4 个注意力头，每头输出 `hidden_dim // 4` 维
 - GCNConv 不支持 `edge_attr` 参数，因此在 `use_transformer=False` 时会忽略边特征
 - 空边情况兼容处理：当 `edge_attr` 的列数与期望不匹配时，自动创建正确维度的空张量
+- 群组级评估脚本最终使用的是群级偏移分支；点级评估脚本使用 `head='point'` 的点级偏移分支
 
 ---
 
@@ -109,22 +115,24 @@ run_ablation/
 
 #### `RadarFileDataset`
 
+`run_ablation/dataset.py` 本身只是一个薄包装，直接重导出 `sim_env.dataset.RadarFileDataset`；实际的建图逻辑在 `sim_env/dataset.py`。
+
 | 属性 | 说明 |
 |---|---|
 | 基类 | `torch_geometric.data.Dataset` |
 | 数据源 | `config.DATA_ROOT/{split}/` 目录下的 `.npy` 文件 |
 | 数据组织 | 每个 `.npy` 文件为一个 episode（场景序列），包含多帧数据 |
-| 建图半径 | `conn_radius = 80.0`（适应 ETH 行人数据集的尺度） |
+| 建图半径 | `conn_radius = 30.0` |
+| 节点特征 | 2D：`[x, y]` |
+| 边特征 | 3D：`[rel_x, rel_y, dist]` |
 
 **每帧数据处理流程：**
 
-1. **节点特征构建**：直接使用测量点坐标（可能是 2 维 [x, y] 或 4 维 [x, y, vx, vy]）
-2. **图构建**：基于欧氏距离，在 `conn_radius` 内的点对之间建边（排除自环）
-3. **边属性计算**：
-   - 若节点仅有位置信息（2 维）：`edge_attr = [rel_x, rel_y, dist]`（3 维）
-   - 若节点包含速度信息（4 维）：`edge_attr = [rel_x, rel_y, dist, rel_vx, rel_vy, cos_sim]`（6 维）
+1. **节点特征构建**：直接使用测量点坐标 `meas`，构成 2D 节点特征 `[x, y]`
+2. **图构建**：基于欧氏距离，在 `conn_radius=30.0` 内的点对之间建边（排除自环）
+3. **边属性计算**：`edge_attr = [rel_x, rel_y, dist]`（3 维）
 4. **边标签生成**：若两端节点属于同一目标（且标签非 0），则边标签为 1，否则为 0
-5. **封装为 PyG Data 对象**：包含 `x`（节点特征）、`edge_index`、`edge_attr`、`edge_label`、`point_labels`（每点所属目标 ID）、`gt_centers`（真值目标中心）
+5. **封装为 PyG Data 对象**：包含 `x`、`edge_index`、`edge_attr`、`edge_label`、`point_labels`、`gt_centers`，以及点级训练 / 评估会用到的 `gt_points`、`point_ids`、`has_gt_points`、`has_point_ids`
 
 **返回值：** 一个 `graph_list`（每个 episode 中所有有效帧的图列表）
 
@@ -139,38 +147,39 @@ run_ablation/
 | 步骤 | 说明 |
 |---|---|
 | 数据加载 | 训练集最多使用前 500 个样本（加速消融实验），验证集使用全量 |
-| 维度检测 | 自动从验证集中检测实际的 `input_node_dim` 和 `input_edge_dim`，避免硬编码不匹配 |
+| 维度检测 | 自动从验证集（若为空则回退训练集）检测实际的 `input_node_dim` 和 `input_edge_dim`，避免硬编码不匹配 |
 | 模型创建 | 使用 `AblationGNNTracker(**model_config)` |
-| 优化器 | AdamW，学习率 `0.0005`，权重衰减 `1e-4` |
+| 优化器 | AdamW，学习率来自 `config.LEARNING_RATE`（当前为 `0.0005`），权重衰减 `1e-4` |
 | 训练轮数 | 10 个 Epoch（对消融实验足够区分性能差异） |
 | 梯度裁剪 | `max_norm=1.0` |
-| 损失函数 | 复用 `train_sim.compute_loss`，包含边分类损失（BCE）+ 异方差偏移回归损失（NLL） |
-| 模型保存 | 验证集 loss 最优时保存至 `sim_env/run_ablation/model/model_{name}_v2.pth` |
+| 损失函数 | 复用 `sim_env.train_sim.compute_frame_loss` |
+| 模型保存 | 验证集 loss 最优时保存至 `sim_env/run_ablation/model/model_{name}.pth` |
 | NaN 保护 | 跳过 loss 为 NaN 或 Inf 的样本 |
 
-**损失函数细节（来自 `train_sim.compute_loss`）：**
+**损失函数细节（来自 `sim_env.train_sim.compute_frame_loss`）：**
 
 ```
-总损失 = loss_edge + loss_reg
-
-loss_edge: 二元交叉熵（边分类）
-    - 正样本为同一目标的边，负样本为不同目标的边
-    - 动态计算正负样本比作为权重（上限 10.0）
-
-loss_reg: 异方差偏移回归（NLL 形式）
-    - target_offset = gt_center - current_position
-    - loss = 0.5 * (MSE / σ² + log(σ²))
-    - 模型可学习每个点的预测不确定性 σ
-    - 仅对有有效标签（label ≠ 0）的点计算
+总损失 = loss_edge
+       + config.LAMBDA_GROUP * loss_group
+       + config.LAMBDA_POINT * loss_point
+       + config.LAMBDA_TEMP  * loss_temp
 ```
+
+- `loss_edge`：边分类 BCE 损失
+- `loss_group`：群级 offset 的异方差回归损失
+- `loss_point`：点级 offset 的异方差回归损失
+- `loss_temp`：基于相邻帧点级校正结果的时序一致性损失
+- 以上权重来自 `sim_env/config.py`（当前默认：`LAMBDA_GROUP=0.75`、`LAMBDA_POINT=1.25`、`LAMBDA_TEMP=0.2`）
+- 当 `LAMBDA_POINT > 0` 或 `LAMBDA_TEMP > 0` 时，训练样本必须包含 `gt_points / point_ids`，否则 `compute_frame_loss` 会直接报错
 
 **实验配置（在 `__main__` 中）：**
 
 ```python
-# 可选配置（通过注释切换训练哪个变体）：
-"Plain_GCN":              {"use_fourier": True,  "fusion_mode": 'adaptive', "use_transformer": False}
-"model_No_Fourier":       {"use_fourier": False, "fusion_mode": 'adaptive', "use_transformer": True}
-"model_No_Adaptive_Fusion": {"use_fourier": True,  "fusion_mode": 'last',     "use_transformer": True}
+experiments = {
+    "No_Fourier": {"use_fourier": False, "fusion_mode": 'adaptive', "use_transformer": True},
+    "No_Adaptive_Fusion": {"use_fourier": True, "fusion_mode": 'last', "use_transformer": True},
+    "Plain_GCN": {"use_fourier": True, "fusion_mode": 'adaptive', "use_transformer": False},
+}
 ```
 
 ---
@@ -188,8 +197,9 @@ loss_reg: 异方差偏移回归（NLL 形式）
     │
     ├─ 遍历测试集中每个 episode
     │   ├─ 遍历每一帧图数据
-    │   │   ├─ 模型推理 → (edge_scores, offsets, ...)
-    │   │   ├─ 位置校正: corrected_pos = meas_points + offsets
+    │   │   ├─ 模型推理 → TrackerOutputs(...)
+    │   │   ├─ 群组级位置校正: corrected_pos = meas_points + group_offsets
+    │   │   │   （脚本当前通过兼容写法读取第二个输出，本质上对应 group_offsets）
     │   │   │
     │   │   ├─ 聚类分组:
     │   │   │   ├─ [Full Model] 尝试连通分量法：
@@ -229,28 +239,43 @@ loss_reg: 异方差偏移回归（NLL 形式）
 
 ```python
 # 1. 评估完整模型（Full_Model）
-#    使用 GNNGroupTracker，加载 sim_env/model/best_model_v5.pth（或 v4.pth）
+#    使用 GNNGroupTracker
+#    权重优先取 sim_env/config.py 的 MODEL_SAVE_PATH，若不存在则回退 MODEL_USE_PATH
 
-# 2. 评估消融变体（均使用 hidden_dim=64）
-#    No_Fourier:          model_No_Fourier.pth
-#    No_Adaptive_Fusion:  model_No_Adaptive_Fusion.pth
-#    Plain_GCN:           model_Plain_GCN.pth
+# 2. 评估消融变体
+#    脚本里显式使用 hidden_dim=64，并默认加载：
+#    No_Fourier:           model_No_Fourier.pth
+#    No_Adaptive_Fusion:   model_No_Adaptive_Fusion.pth
+#    Plain_GCN:            model_Plain_GCN.pth
 ```
 
-注意：消融变体使用 `hidden_dim=64`，而完整模型使用 `hidden_dim=96`。这是因为消融变体在训练时使用了 `config.HIDDEN_DIM=64` 作为默认值。
+说明：完整模型的权重路径不是写死在本文件里，而是通过 `sim_env/config.py` 的 `MODEL_SAVE_PATH / MODEL_USE_PATH` 获取；完整模型的隐藏维度跟随当前模型 / 配置，`run_comparison.py` 里的消融分支则显式使用 `hidden_dim=64`。
+
+#### 补充：`run_point_comparison.py` — 点级消融对比
+
+该脚本用于补充**点级（point-level）**消融评估，复用 `sim_env/evaluate_single.py` 中已经验证过的点级后处理链路：
+
+- 使用 `infer_corrected_points(..., head='point')`，即点偏移分支而不是群级偏移分支
+- 先通过 `filter_clustered_points` 做 DBSCAN 噪声过滤，只保留非噪声点进入后续点跟踪
+- 群组级轨迹仍由 `GNNPostProcessor` 维护
+- 点 ID 通过 `GroupConstrainedPointAssociator` 在群组约束下完成关联
+- 最终结果输出到 `sim_env/run_ablation/output/result/ablation_point_comparison.csv`
+- 历史 legacy 单头 / 仅群级权重可能无法直接加载到这条新点级管线；脚本会给出 warning 并跳过对应 checkpoint
 
 ---
 
 ### 5. `model/` — 模型权重文件
 
-| 文件 | 对应变体 | 说明 |
+| 文件 / 命名模式 | 对应变体 | 说明 |
 |---|---|---|
-| `model_No_Fourier.pth` | No_Fourier (v1) | 第一轮训练的权重 |
-| `model_model_No_Fourier_v2.pth` | No_Fourier (v2) | 第二轮训练的权重（`train_ablation.py` 生成） |
-| `model_No_Adaptive_Fusion.pth` | No_Adaptive_Fusion (v1) | 第一轮训练的权重 |
-| `model_model_No_Adaptive_Fusion_v2.pth` | No_Adaptive_Fusion (v2) | 第二轮训练的权重 |
-| `model_Plain_GCN.pth` | Plain_GCN (v1) | 第一轮训练的权重 |
-| `model_Plain_GCN_v2.pth` | Plain_GCN (v2) | 第二轮训练的权重 |
+| `model_No_Fourier.pth` | No_Fourier | 当前 `train_ablation.py` 的标准输出命名；`run_comparison.py` / `run_point_comparison.py` 默认读取 |
+| `model_No_Adaptive_Fusion.pth` | No_Adaptive_Fusion | 当前 `train_ablation.py` 的标准输出命名；`run_comparison.py` / `run_point_comparison.py` 默认读取 |
+| `model_Plain_GCN.pth` | Plain_GCN | 当前 `train_ablation.py` 的标准输出命名；`run_comparison.py` / `run_point_comparison.py` 默认读取 |
+| `model_model_No_Fourier_v2.pth` | No_Fourier（legacy） | 历史遗留命名，保留在目录中供对照；不属于当前脚本默认保存路径 |
+| `model_model_No_Adaptive_Fusion_v2.pth` | No_Adaptive_Fusion（legacy） | 历史遗留命名，保留在目录中供对照；不属于当前脚本默认保存路径 |
+| `model_Plain_GCN_v2.pth` | Plain_GCN（legacy） | 历史遗留 `_v2` 权重；不属于当前脚本默认保存路径 |
+
+补充说明：当前脚本默认读写的是不带 `_v2` 的 `model_{name}.pth`；目录中的 `_v2` / `model_model_*` 文件表示历史训练产物仍在保留，部分旧权重可能不兼容新的双 head 点级评估管线。
 
 ---
 
@@ -271,6 +296,10 @@ loss_reg: 异方差偏移回归（NLL 形式）
 | **IDSW** | ID 切换总数 | ↓ 越低越好 |
 | **FAR** | 虚警率（每帧误检数） | ↓ 越低越好 |
 | **Count Err** | 平均每帧目标计数误差 | ↓ 越低越好 |
+
+#### `ablation_point_comparison.csv`
+
+由 `run_point_comparison.py` 生成的点级消融对比结果。它对应的是 `head='point'` 的点偏移校正管线，并结合 DBSCAN 噪声过滤、`GNNPostProcessor` 群组跟踪和 `GroupConstrainedPointAssociator` 组约束点关联，便于重点比较 OSPA / RMSE / IDSW / MOTA 等点级指标。
 
 #### 实验结果总览
 
@@ -345,9 +374,11 @@ TransformerConv 注意力机制 >> 傅里叶位置编码 ≈ 自适应层融合
 ### 训练消融变体
 
 ```bash
-# 在 sim_env/ 目录下运行
-cd sim_env
-python -m run_ablation.train_ablation
+# 推荐从仓库根目录运行
+python -m sim_env.run_ablation.train_ablation
+
+# 若已切到 sim_env/ 目录，也可运行
+# python -m run_ablation.train_ablation
 ```
 
 在 `train_ablation.py` 的 `__main__` 中修改 `experiments` 字典来选择要训练的变体。
@@ -355,20 +386,39 @@ python -m run_ablation.train_ablation
 ### 运行评估对比
 
 ```bash
-cd sim_env
-python -m run_ablation.run_comparison
+# 推荐从仓库根目录运行
+python -m sim_env.run_ablation.run_comparison
+
+# 若已切到 sim_env/ 目录，也可运行
+# python -m run_ablation.run_comparison
 ```
 
-结果将保存至 `run_ablation/output/result/ablation_comparison_final.csv`。
+结果将保存至 `sim_env/run_ablation/output/result/ablation_comparison_final.csv`。
+
+### 运行点级评估对比
+
+```bash
+# 推荐从仓库根目录运行
+python -m sim_env.run_ablation.run_point_comparison
+
+# 若已切到 sim_env/ 目录，也可运行
+# python -m run_ablation.run_point_comparison
+```
+
+结果将保存至 `sim_env/run_ablation/output/result/ablation_point_comparison.csv`。
+
+补充说明：本目录部分脚本仍带有项目内相对路径假设，尤其 `run_comparison.py` 的结果 CSV 输出路径是相对写法；因此最好按上面的方式或直接从仓库根目录执行。
 
 ---
 
 ## 依赖关系
 
 本模块依赖项目中的以下文件：
-- `sim_env/config.py`：全局配置（数据路径、维度、设备等）
-- `sim_env/model.py`：完整模型 `GNNGroupTracker` 定义
-- `sim_env/train_sim.py`：`compute_loss` 损失函数
-- `sim_env/dataset.py`：（本模块自带了一份副本，与 sim_env 下的共享相同逻辑）
+- `sim_env/config.py`：全局配置（数据路径、维度、设备、loss 权重、checkpoint 路径等）
+- `sim_env/model.py`：完整模型 `GNNGroupTracker` 与 `TrackerOutputs` 定义
+- `sim_env/train_sim.py`：`compute_frame_loss`，定义当前的 `edge + group + point + temp` 训练损失
+- `sim_env/dataset.py`：实际 `RadarFileDataset` 构图逻辑（2D 节点、3D 边、`conn_radius=30.0`，并附带 `gt_points/point_ids` 等字段）
+- `sim_env/run_ablation/dataset.py`：仅重导出 `sim_env.dataset.RadarFileDataset`
+- `sim_env/evaluate_single.py`：点级评估中复用的 `infer_corrected_points`、`filter_clustered_points`、`GroupConstrainedPointAssociator` 等逻辑
 - `metrics.py`：`TrackingMetrics` 评估指标
 - `trackers/gnn_processor.py`：`GNNPostProcessor` 多目标跟踪后处理器
