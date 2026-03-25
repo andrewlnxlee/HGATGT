@@ -20,7 +20,7 @@ from dataset import RadarFileDataset
 from trackers.gnn_processor import GNNPostProcessor
 
 
-NUM = 6  # 选择第几个样本 episode
+NUM = 7  # 选择第几个样本 episode
 
 VIZ_STYLE = {
     'figsize': (8.6, 8.2),

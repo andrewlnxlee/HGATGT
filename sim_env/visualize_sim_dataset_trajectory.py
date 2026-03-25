@@ -5,10 +5,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import matplotlib.pyplot as plt
 import config
-NUM=2
+NUM=31
 def viz_one_sample():
     # 读取刚生成的第 0 个测试样本
-    path = os.path.join(config.DATA_ROOT, 'test', f'sample_0000{NUM}.npy')
+    path = os.path.join(config.DATA_ROOT, 'test', f'sample_000{NUM}.npy')
     if not os.path.exists(path):
         print("请先运行 generate_data.py")
         return

@@ -27,9 +27,9 @@ from trackers.gnn_processor import GNNPostProcessor
 # 想整体往下: 增大 V_OFFSET
 SWAP_XY = True
 FLIP_Y = False
-U_OFFSET = 245.3
-V_OFFSET = -137.5
-ROTATE_DEG = 3.75
+U_OFFSET = 225.3
+V_OFFSET = -197.5
+ROTATE_DEG = -10
 
 FPS_DT = 0.4
 MAX_RENDER_FRAMES = 1500
