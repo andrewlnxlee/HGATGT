@@ -9,8 +9,8 @@ from tqdm import tqdm
 import imageio
 from torch_geometric.data import Data
 from scipy.spatial.distance import cdist
-from collections import defaultdict
 from scipy.optimize import linear_sum_assignment
+from collections import defaultdict
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from sklearn.metrics import adjusted_rand_score
@@ -22,10 +22,12 @@ from trackers.gnn_processor import GNNPostProcessor
 
 FPS_DT = 0.4
 MODEL_CONN_RADIUS = 85.0
-TRACK_ASSIGN_THRESH_PX = 8.0
 MAX_RENDER_FRAMES = 1500
-U_OFFSET = 50
-V_OFFSET = -50
+TRACK_ASSIGN_THRESH_PX = 25.0
+CALIBRATION_SAMPLE_FRAMES = 12
+MOTION_PATCH_RADIUS = 7
+COARSE_OFFSET_RANGE = range(-120, 121, 30)
+FINE_OFFSET_RANGE = range(-20, 21, 5)
 
 
 def parse_obsmat(filepath):
@@ -40,35 +42,204 @@ def parse_obsmat(filepath):
     return frames
 
 
-def world_points_to_pixel(points_world, H_inv, frame_height, u_offset=U_OFFSET, v_offset=V_OFFSET, flip_y=False):
+def project_world_points(points_world, H_inv, frame_width, frame_height, swap_xy, flip_y, u_offset, v_offset):
     if len(points_world) == 0:
         return np.empty((0, 2), dtype=np.float32)
 
-    homo = np.concatenate([
-        points_world[:, 1:2],
-        points_world[:, 0:1],
-        np.ones((len(points_world), 1), dtype=np.float32),
-    ], axis=1).T
+    pts = np.asarray(points_world, dtype=np.float32)
+    if swap_xy:
+        homo = np.stack([pts[:, 1], pts[:, 0], np.ones(len(pts), dtype=np.float32)], axis=1).T
+    else:
+        homo = np.stack([pts[:, 0], pts[:, 1], np.ones(len(pts), dtype=np.float32)], axis=1).T
 
     pixel = H_inv @ homo
     denom = pixel[2]
     valid = np.abs(denom) > 1e-8
 
-    u = np.zeros(len(points_world), dtype=np.float32)
-    v = np.zeros(len(points_world), dtype=np.float32)
+    u = np.full(len(pts), np.nan, dtype=np.float32)
+    v = np.full(len(pts), np.nan, dtype=np.float32)
     u[valid] = pixel[0, valid] / denom[valid]
     v[valid] = pixel[1, valid] / denom[valid]
 
     if flip_y:
-        v = frame_height - 1 - v
+        v[valid] = (frame_height - 1) - v[valid]
 
-    u += u_offset
-    v += v_offset
+    u[valid] += u_offset
+    v[valid] += v_offset
     return np.stack([u, v], axis=1)
 
 
+def estimate_center_offset(points_px, frame_width, frame_height):
+    valid = np.isfinite(points_px).all(axis=1)
+    if not np.any(valid):
+        return 0.0, 0.0
+
+    pts = points_px[valid]
+    lo = np.percentile(pts, 5, axis=0)
+    hi = np.percentile(pts, 95, axis=0)
+    src_center = 0.5 * (lo + hi)
+    dst_center = np.array([frame_width * 0.5, frame_height * 0.55], dtype=np.float32)
+    offset = dst_center - src_center
+    return float(offset[0]), float(offset[1])
+
+
+def score_points_on_motion(motion_map, points_px):
+    if len(points_px) == 0:
+        return -1e9, 0.0
+
+    h, w = motion_map.shape[:2]
+    finite = np.isfinite(points_px).all(axis=1)
+    inside = finite & (points_px[:, 0] >= 0) & (points_px[:, 0] < w) & (points_px[:, 1] >= 0) & (points_px[:, 1] < h)
+    inside_ratio = float(np.mean(inside))
+    if not np.any(inside):
+        return -1e9, inside_ratio
+
+    patch_scores = []
+    for x, y in points_px[inside]:
+        xi = int(round(float(x)))
+        yi = int(round(float(y)))
+        x1 = max(0, xi - MOTION_PATCH_RADIUS)
+        x2 = min(w, xi + MOTION_PATCH_RADIUS + 1)
+        y1 = max(0, yi - MOTION_PATCH_RADIUS)
+        y2 = min(h, yi + MOTION_PATCH_RADIUS + 1)
+        patch_scores.append(float(motion_map[y1:y2, x1:x2].mean()))
+
+    local_motion = float(np.mean(patch_scores)) if patch_scores else 0.0
+    global_motion = float(motion_map.mean()) + 1e-6
+    norm_motion = local_motion / global_motion
+    score = norm_motion * (0.25 + 0.75 * inside_ratio)
+    return score, inside_ratio
+
+
+def collect_calibration_samples(reader, sorted_frames, obs_data):
+    if not sorted_frames:
+        return []
+
+    sample_count = min(CALIBRATION_SAMPLE_FRAMES, len(sorted_frames))
+    sample_indices = np.linspace(0, len(sorted_frames) - 1, sample_count, dtype=int)
+
+    samples = []
+    for idx in np.unique(sample_indices):
+        fid = sorted_frames[idx]
+        if fid <= 0:
+            continue
+        try:
+            curr = reader.get_data(fid)
+            prev = reader.get_data(max(fid - 1, 0))
+        except Exception:
+            continue
+
+        raw_pos = np.asarray([p['pos'] for p in obs_data[fid]], dtype=np.float32)
+        if len(raw_pos) == 0:
+            continue
+
+        curr_gray = cv2.cvtColor(curr, cv2.COLOR_RGB2GRAY)
+        prev_gray = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
+        motion = cv2.absdiff(curr_gray, prev_gray)
+        motion = cv2.GaussianBlur(motion, (5, 5), 0)
+
+        samples.append({
+            'fid': fid,
+            'raw_pos': raw_pos,
+            'motion': motion,
+            'frame_width': curr.shape[1],
+            'frame_height': curr.shape[0],
+        })
+
+    return samples
+
+
+def search_offsets(samples, H_inv, swap_xy, flip_y, base_u, base_v, delta_range):
+    best = None
+    for du in delta_range:
+        for dv in delta_range:
+            u_offset = base_u + du
+            v_offset = base_v + dv
+            scores = []
+            inside_ratios = []
+
+            for sample in samples:
+                pts_px = project_world_points(
+                    sample['raw_pos'],
+                    H_inv,
+                    sample['frame_width'],
+                    sample['frame_height'],
+                    swap_xy=swap_xy,
+                    flip_y=flip_y,
+                    u_offset=u_offset,
+                    v_offset=v_offset,
+                )
+                score, inside_ratio = score_points_on_motion(sample['motion'], pts_px)
+                scores.append(score)
+                inside_ratios.append(inside_ratio)
+
+            mean_score = float(np.mean(scores)) if scores else -1e9
+            mean_inside = float(np.mean(inside_ratios)) if inside_ratios else 0.0
+
+            cand = {
+                'swap_xy': swap_xy,
+                'flip_y': flip_y,
+                'u_offset': float(u_offset),
+                'v_offset': float(v_offset),
+                'score': mean_score,
+                'inside_ratio': mean_inside,
+            }
+            if best is None or cand['score'] > best['score']:
+                best = cand
+
+    return best
+
+
+def auto_calibrate_projection(reader, sorted_frames, obs_data, H_inv):
+    samples = collect_calibration_samples(reader, sorted_frames, obs_data)
+    if not samples:
+        return {
+            'swap_xy': True,
+            'flip_y': False,
+            'u_offset': 0.0,
+            'v_offset': 0.0,
+            'score': 0.0,
+            'inside_ratio': 0.0,
+        }
+
+    frame_width = samples[0]['frame_width']
+    frame_height = samples[0]['frame_height']
+    all_points = np.concatenate([sample['raw_pos'] for sample in samples], axis=0)
+
+    best = None
+    for swap_xy in [True, False]:
+        for flip_y in [False, True]:
+            raw_px = project_world_points(
+                all_points,
+                H_inv,
+                frame_width,
+                frame_height,
+                swap_xy=swap_xy,
+                flip_y=flip_y,
+                u_offset=0.0,
+                v_offset=0.0,
+            )
+            base_u, base_v = estimate_center_offset(raw_px, frame_width, frame_height)
+
+            coarse_best = search_offsets(samples, H_inv, swap_xy, flip_y, base_u, base_v, COARSE_OFFSET_RANGE)
+            fine_best = search_offsets(
+                samples,
+                H_inv,
+                swap_xy,
+                flip_y,
+                coarse_best['u_offset'],
+                coarse_best['v_offset'],
+                FINE_OFFSET_RANGE,
+            )
+
+            if best is None or fine_best['score'] > best['score']:
+                best = fine_best
+
+    return best
+
+
 def scaled_to_world(points_scaled):
-    return (points_scaled - np.array(config.COORD_OFFSET, dtype=np.float32)) / float(config.COORD_SCALE)
+    return (points_scaled - np.asarray(config.COORD_OFFSET, dtype=np.float32)) / float(config.COORD_SCALE)
 
 
 def build_group_detections(group_labels, corrected_pixels):
@@ -82,8 +253,8 @@ def build_group_detections(group_labels, corrected_pixels):
         if len(pts) > 1:
             wh = np.percentile(pts, 95, axis=0) - np.percentile(pts, 5, axis=0)
         else:
-            wh = np.array([6.0, 6.0], dtype=np.float32)
-        det_shapes.append(np.maximum(wh, 4.0))
+            wh = np.array([8.0, 8.0], dtype=np.float32)
+        det_shapes.append(np.maximum(wh, 6.0))
 
     if det_centers:
         det_centers = np.asarray(det_centers, dtype=np.float32)
@@ -101,11 +272,8 @@ def visualize_hotel_on_video():
     h_matrix_path = 'datasets/ewap_dataset/seq_hotel/H.txt'
     obsmat_path = 'datasets/ewap_dataset/seq_hotel/obsmat.txt'
     model_path = config.EWAP_MODEL_USE_PATH
-    save_path = os.path.join(config.OUTPUT_MP4_DIR, 'hotel_v2_closed_loop.mp4')
+    save_path = os.path.join(config.OUTPUT_MP4_DIR, 'hotel_v3_auto_calibrated.mp4')
     device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
-
-    # Hotel 相对 ETH 需要单独做一次垂直镜像修正。
-    flip_y = True
 
     H = np.loadtxt(h_matrix_path)
     H_inv = np.linalg.inv(H)
@@ -126,6 +294,17 @@ def visualize_hotel_on_video():
         print(f'❌ 无法读取视频: {e}')
         return
 
+    projection_cfg = auto_calibrate_projection(reader, sorted_frames, obs_data, H_inv)
+    print(
+        '自动校准完成: '
+        f"swap_xy={projection_cfg['swap_xy']}, "
+        f"flip_y={projection_cfg['flip_y']}, "
+        f"u_offset={projection_cfg['u_offset']:.1f}, "
+        f"v_offset={projection_cfg['v_offset']:.1f}, "
+        f"score={projection_cfg['score']:.3f}, "
+        f"inside={projection_cfg['inside_ratio']:.3f}"
+    )
+
     writer = imageio.get_writer(save_path, fps=10, quality=9, codec='libx264')
     print('保存视频到: ', save_path)
 
@@ -140,15 +319,15 @@ def visualize_hotel_on_video():
     print('正在加载真值标签(物理规则基准)...')
     ped_to_group_gt = compute_pseudo_labels(obsmat_path)
 
-    print(f'正在生成 {scene_name} 闭环校验可视化视频 (共 {len(sorted_frames[:MAX_RENDER_FRAMES])} 采样点)...')
+    print(f'正在生成 {scene_name} 自动校准闭环可视化视频 (共 {len(sorted_frames[:MAX_RENDER_FRAMES])} 采样点)...')
     for fid in tqdm(sorted_frames[:MAX_RENDER_FRAMES]):
         try:
             frame = reader.get_data(fid)
-        except:
+        except Exception:
             continue
 
         frame = frame.copy()
-        frame_height = frame.shape[0]
+        frame_height, frame_width = frame.shape[0], frame.shape[1]
         peds = obs_data[fid]
         if len(peds) == 0:
             writer.append_data(frame)
@@ -157,7 +336,6 @@ def visualize_hotel_on_video():
         raw_pos = np.asarray([p['pos'] for p in peds], dtype=np.float32)
         raw_vel = np.asarray([p['vel'] for p in peds], dtype=np.float32)
 
-        # 这里必须与训练/数据集保持同尺度，否则模型输出会漂。
         scaled_pos = raw_pos * float(config.COORD_SCALE) + np.asarray(config.COORD_OFFSET, dtype=np.float32)
         scaled_vel = raw_vel * FPS_DT * float(config.COORD_SCALE)
 
@@ -170,7 +348,7 @@ def visualize_hotel_on_video():
 
         if len(src) > 0:
             pos_src, pos_dst = x_in[src, :2], x_in[dst, :2]
-            vel_src, vel_dst = x_in[src, 2:], x_in[dst, 2:]
+            vel_src, vel_dst = x_in[src, 2:4], x_in[dst, 2:4]
             rel_pos = pos_dst - pos_src
             dist = torch.norm(rel_pos, dim=1, keepdim=True)
             rel_v = vel_dst - vel_src
@@ -197,7 +375,16 @@ def visualize_hotel_on_video():
 
         corrected_scaled = scaled_pos + offsets.detach().cpu().numpy()
         corrected_world = scaled_to_world(corrected_scaled)
-        corrected_pixels = world_points_to_pixel(corrected_world, H_inv, frame_height, flip_y=flip_y)
+        corrected_pixels = project_world_points(
+            corrected_world,
+            H_inv,
+            frame_width,
+            frame_height,
+            swap_xy=projection_cfg['swap_xy'],
+            flip_y=projection_cfg['flip_y'],
+            u_offset=projection_cfg['u_offset'],
+            v_offset=projection_cfg['v_offset'],
+        )
 
         if len(edge_scores) > 0:
             max_score = edge_scores.max().item()
@@ -265,13 +452,20 @@ def visualize_hotel_on_video():
             tid = label_to_tid.get(label)
             color = colors.get(tid, (180, 200, 255))
 
-            if len(group_pts) > 1:
-                if len(group_pts) == 2:
-                    cv2.line(overlay, tuple(group_pts[0]), tuple(group_pts[1]), color, 28, lineType=cv2.LINE_AA)
-                else:
-                    hull = cv2.convexHull(group_pts)
-                    cv2.fillConvexPoly(overlay, hull, color, lineType=cv2.LINE_AA)
-                    cv2.polylines(overlay, [hull], True, color, 18, lineType=cv2.LINE_AA)
+            valid_pts = []
+            for pt in group_pts:
+                if 0 <= pt[0] < frame_width and 0 <= pt[1] < frame_height:
+                    valid_pts.append(pt)
+            if len(valid_pts) < 2:
+                continue
+
+            valid_pts = np.asarray(valid_pts, dtype=np.int32)
+            if len(valid_pts) == 2:
+                cv2.line(overlay, tuple(valid_pts[0]), tuple(valid_pts[1]), color, 24, lineType=cv2.LINE_AA)
+            else:
+                hull = cv2.convexHull(valid_pts)
+                cv2.fillConvexPoly(overlay, hull, color, lineType=cv2.LINE_AA)
+                cv2.polylines(overlay, [hull], True, color, 14, lineType=cv2.LINE_AA)
 
         cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
 
@@ -282,7 +476,8 @@ def visualize_hotel_on_video():
             pts = np.round(corrected_pixels[members]).astype(np.int32)
 
             for pt in pts:
-                cv2.circle(frame, tuple(pt), 4, color, -1, lineType=cv2.LINE_AA)
+                if 0 <= pt[0] < frame_width and 0 <= pt[1] < frame_height:
+                    cv2.circle(frame, tuple(pt), 4, color, -1, lineType=cv2.LINE_AA)
 
             if tid is None:
                 continue
@@ -292,16 +487,31 @@ def visualize_hotel_on_video():
 
             hist = np.array(track_history[tid][-25:], dtype=np.int32)
             for j in range(len(hist) - 1):
+                p1 = hist[j]
+                p2 = hist[j + 1]
+                if not (0 <= p1[0] < frame_width and 0 <= p1[1] < frame_height and 0 <= p2[0] < frame_width and 0 <= p2[1] < frame_height):
+                    continue
                 alpha = (j + 1) / len(hist)
                 trail_color = [int(c * alpha + 100 * (1 - alpha)) for c in color]
-                cv2.line(frame, tuple(hist[j]), tuple(hist[j + 1]), trail_color, 2, lineType=cv2.LINE_AA)
+                cv2.line(frame, tuple(p1), tuple(p2), trail_color, 2, lineType=cv2.LINE_AA)
 
-            cv2.circle(frame, center_int, 6, color, -1, lineType=cv2.LINE_AA)
-            cv2.putText(frame, str(tid), (center_int[0] + 8, center_int[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            if 0 <= center_int[0] < frame_width and 0 <= center_int[1] < frame_height:
+                cv2.circle(frame, center_int, 6, color, -1, lineType=cv2.LINE_AA)
+                cv2.putText(frame, str(tid), (center_int[0] + 8, center_int[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
         mean_loop_err = float(np.mean(frame_loop_error)) if frame_loop_error else 0.0
         cv2.putText(frame, f'Frame {fid}', (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, f'LoopErr {mean_loop_err:.2f}px', (15, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            f"swap={int(projection_cfg['swap_xy'])} flip={int(projection_cfg['flip_y'])}",
+            (15, 84),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
         writer.append_data(frame)
 
@@ -324,6 +534,7 @@ def visualize_hotel_on_video():
     print(f'🔹 综合 F1 分数 (F1-Score): {f1:.4f}')
     print(f'🔹 闭环平均误差 (Loop Error): {avg_loop_err:.2f}px')
     print(f'🔹 闭环最大误差 (Loop Error): {max_loop_err:.2f}px')
+    print(f"🔹 投影参数: swap_xy={projection_cfg['swap_xy']}, flip_y={projection_cfg['flip_y']}, u_offset={projection_cfg['u_offset']:.1f}, v_offset={projection_cfg['v_offset']:.1f}")
     print('=' * 50)
 
 
