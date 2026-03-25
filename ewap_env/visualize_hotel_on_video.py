@@ -29,6 +29,7 @@ SWAP_XY = True
 FLIP_Y = False
 U_OFFSET = 245.3
 V_OFFSET = -137.5
+ROTATE_DEG = 3.75
 
 FPS_DT = 0.4
 MAX_RENDER_FRAMES = 1500
@@ -46,6 +47,27 @@ def parse_obsmat(filepath):
             'vel': [row[5], row[7]],
         })
     return frames
+
+
+def rotate_points(points_px, frame_width, frame_height, rotate_deg):
+    if len(points_px) == 0:
+        return points_px
+
+    pts = np.asarray(points_px, dtype=np.float32).copy()
+    valid = np.isfinite(pts).all(axis=1)
+    if not np.any(valid):
+        return pts
+
+    center = np.array([frame_width * 0.5, frame_height * 0.5], dtype=np.float32)
+    theta = np.deg2rad(rotate_deg)
+    rot = np.array([
+        [np.cos(theta), -np.sin(theta)],
+        [np.sin(theta),  np.cos(theta)],
+    ], dtype=np.float32)
+
+    pts_valid = pts[valid] - center
+    pts[valid] = pts_valid @ rot.T + center
+    return pts
 
 
 def project_world_points(points_world, H_inv, frame_width, frame_height):
@@ -72,7 +94,10 @@ def project_world_points(points_world, H_inv, frame_width, frame_height):
 
     u[valid] += U_OFFSET
     v[valid] += V_OFFSET
-    return np.stack([u, v], axis=1)
+
+    points_px = np.stack([u, v], axis=1)
+    points_px = rotate_points(points_px, frame_width, frame_height, ROTATE_DEG)
+    return points_px
 
 
 def scaled_to_world(points_scaled):
@@ -133,7 +158,7 @@ def visualize_hotel_on_video():
 
     writer = imageio.get_writer(save_path, fps=10, quality=9, codec='libx264')
     print('保存视频到: ', save_path)
-    print(f'固定投影参数: swap_xy={SWAP_XY}, flip_y={FLIP_Y}, u_offset={U_OFFSET}, v_offset={V_OFFSET}')
+    print(f'固定投影参数: swap_xy={SWAP_XY}, flip_y={FLIP_Y}, u_offset={U_OFFSET}, v_offset={V_OFFSET}, rotate_deg={ROTATE_DEG}')
 
     colors = {}
     track_history = defaultdict(list)
@@ -316,7 +341,8 @@ def visualize_hotel_on_video():
 
         cv2.putText(frame, f'Frame {fid}', (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, f'U={U_OFFSET:.1f} V={V_OFFSET:.1f}', (15, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, f'swap={int(SWAP_XY)} flip={int(FLIP_Y)}', (15, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f'rot={ROTATE_DEG:.2f}', (15, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f'swap={int(SWAP_XY)} flip={int(FLIP_Y)}', (15, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
         writer.append_data(frame)
 
@@ -335,7 +361,7 @@ def visualize_hotel_on_video():
     print(f'🔹 两两聚类准确率 (Precision): {precision * 100:.2f}%')
     print(f'🔹 两两聚类召回率 (Recall): {recall * 100:.2f}%')
     print(f'🔹 综合 F1 分数 (F1-Score): {f1:.4f}')
-    print(f'🔹 固定投影参数: swap_xy={SWAP_XY}, flip_y={FLIP_Y}, u_offset={U_OFFSET}, v_offset={V_OFFSET}')
+    print(f'🔹 固定投影参数: swap_xy={SWAP_XY}, flip_y={FLIP_Y}, u_offset={U_OFFSET}, v_offset={V_OFFSET}, rotate_deg={ROTATE_DEG}')
     print('=' * 50)
 
 
