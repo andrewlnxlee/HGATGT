@@ -385,6 +385,16 @@ def visualize_hotel_on_video():
             u_offset=projection_cfg['u_offset'],
             v_offset=projection_cfg['v_offset'],
         )
+        raw_pixels = project_world_points(
+            raw_pos,
+            H_inv,
+            frame_width,
+            frame_height,
+            swap_xy=projection_cfg['swap_xy'],
+            flip_y=projection_cfg['flip_y'],
+            u_offset=projection_cfg['u_offset'],
+            v_offset=projection_cfg['v_offset'],
+        )
 
         if len(edge_scores) > 0:
             max_score = edge_scores.max().item()
@@ -448,7 +458,7 @@ def visualize_hotel_on_video():
         overlay = frame.copy()
         for label in unique_labels:
             members = np.where(group_labels == label)[0]
-            group_pts = np.round(corrected_pixels[members]).astype(np.int32)
+            group_pts = np.round(raw_pixels[members]).astype(np.int32)
             tid = label_to_tid.get(label)
             color = colors.get(tid, (180, 200, 255))
 
@@ -473,7 +483,7 @@ def visualize_hotel_on_video():
             members = np.where(group_labels == label)[0]
             tid = label_to_tid.get(label)
             color = colors.get(tid, (180, 200, 255))
-            pts = np.round(corrected_pixels[members]).astype(np.int32)
+            pts = np.round(raw_pixels[members]).astype(np.int32)
 
             for pt in pts:
                 if 0 <= pt[0] < frame_width and 0 <= pt[1] < frame_height:
@@ -500,12 +510,17 @@ def visualize_hotel_on_video():
                 cv2.putText(frame, str(tid), (center_int[0] + 8, center_int[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
         mean_loop_err = float(np.mean(frame_loop_error)) if frame_loop_error else 0.0
+        render_shift = corrected_pixels - raw_pixels
+        render_shift_valid = np.isfinite(render_shift).all(axis=1)
+        mean_render_shift = float(np.linalg.norm(render_shift[render_shift_valid], axis=1).mean()) if np.any(render_shift_valid) else 0.0
+
         cv2.putText(frame, f'Frame {fid}', (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, f'LoopErr {mean_loop_err:.2f}px', (15, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f'RenderShift {mean_render_shift:.2f}px', (15, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(
             frame,
             f"swap={int(projection_cfg['swap_xy'])} flip={int(projection_cfg['flip_y'])}",
-            (15, 84),
+            (15, 112),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (255, 255, 255),
