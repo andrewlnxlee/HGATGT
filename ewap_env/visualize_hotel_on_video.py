@@ -37,22 +37,7 @@ MODEL_CONN_RADIUS = 85.0
 TRACK_ASSIGN_THRESH_PX = 25.0
 
 DEFAULT_GROUP_COLOR = (180, 200, 255)
-OVERLAY_ALPHA = 0.22
-GROUP_BAND_THICKNESS = 26
-GROUP_OUTLINE_THICKNESS = 6
-SINGLE_GROUP_FILL_RADIUS = 18
-SINGLE_GROUP_RING_RADIUS = 22
-SINGLE_GROUP_RING_THICKNESS = 3
-MEMBER_POINT_RADIUS = 5
-MEMBER_POINT_OUTLINE_RADIUS = 7
 TRAIL_LENGTH = 25
-TRAIL_WIDTH_MIN = 2
-TRAIL_WIDTH_MAX = 4
-CENTROID_OUTER_RADIUS = 11
-CENTROID_INNER_RADIUS = 6
-LABEL_FONT_SCALE = 0.62
-LABEL_OUTLINE_THICKNESS = 3
-LABEL_TEXT_THICKNESS = 2
 
 
 def parse_obsmat(filepath):
@@ -179,7 +164,7 @@ def visualize_hotel_on_video():
     print(f'固定投影参数: swap_xy={SWAP_XY}, flip_y={FLIP_Y}, u_offset={U_OFFSET}, v_offset={V_OFFSET}, rotate_deg={ROTATE_DEG}')
 
     colors = {}
-    track_history = defaultdict(list)
+    history = defaultdict(list)
 
     stats_ari = []
     total_tp, total_fp, total_fn, total_tn = 0, 0, 0, 0
@@ -284,11 +269,8 @@ def visualize_hotel_on_video():
         unique_labels, det_centers_px, det_shapes_px = build_group_detections(group_labels, corrected_pixels)
         pred_centers_px, pred_ids, _ = tracker.update(det_centers_px, det_shapes_px)
 
-        for center, tid in zip(pred_centers_px, pred_ids):
+        for _, tid in zip(pred_centers_px, pred_ids):
             tid = int(tid)
-            track_history[tid].append(center.copy())
-            if len(track_history[tid]) > 50:
-                track_history[tid].pop(0)
             if tid not in colors:
                 colors[tid] = tuple(int(x) for x in rng.integers(100, 255, size=3))
 
@@ -303,75 +285,46 @@ def visualize_hotel_on_video():
                     label_to_tid[label] = int(pred_ids[ci])
                     label_to_center[label] = pred_centers_px[ci]
 
-        overlay = frame.copy()
         for label in unique_labels:
             members = np.where(group_labels == label)[0]
-            group_pts = np.round(raw_pixels[members]).astype(np.int32)
-            tid = label_to_tid.get(label)
-            color = colors.get(tid, DEFAULT_GROUP_COLOR)
-
-            valid_pts = []
-            for pt in group_pts:
-                if 0 <= pt[0] < frame_width and 0 <= pt[1] < frame_height:
-                    valid_pts.append(pt)
-
-            if len(valid_pts) == 1 and tid is not None:
-                center_pt = tuple(valid_pts[0])
-                cv2.circle(overlay, center_pt, SINGLE_GROUP_FILL_RADIUS, color, -1, lineType=cv2.LINE_AA)
-                cv2.circle(frame, center_pt, SINGLE_GROUP_RING_RADIUS, color, SINGLE_GROUP_RING_THICKNESS, lineType=cv2.LINE_AA)
-                cv2.circle(frame, center_pt, SINGLE_GROUP_RING_RADIUS + 4, (245, 245, 245), 1, lineType=cv2.LINE_AA)
-                continue
-
-            if len(valid_pts) < 2:
-                continue
-
-            valid_pts = np.asarray(valid_pts, dtype=np.int32)
-            if len(valid_pts) == 2:
-                cv2.line(overlay, tuple(valid_pts[0]), tuple(valid_pts[1]), color, GROUP_BAND_THICKNESS, lineType=cv2.LINE_AA)
-                cv2.line(frame, tuple(valid_pts[0]), tuple(valid_pts[1]), color, GROUP_OUTLINE_THICKNESS, lineType=cv2.LINE_AA)
-            else:
-                hull = cv2.convexHull(valid_pts)
-                cv2.fillConvexPoly(overlay, hull, color, lineType=cv2.LINE_AA)
-                cv2.polylines(frame, [hull], True, (245, 245, 245), GROUP_OUTLINE_THICKNESS + 2, lineType=cv2.LINE_AA)
-                cv2.polylines(frame, [hull], True, color, GROUP_OUTLINE_THICKNESS, lineType=cv2.LINE_AA)
-
-        cv2.addWeighted(overlay, OVERLAY_ALPHA, frame, 1.0 - OVERLAY_ALPHA, 0, frame)
+            if len(members) > 1:
+                group_pts = np.round(raw_pixels[members]).astype(np.int32)
+                valid_pts = []
+                for pt in group_pts:
+                    if 0 <= pt[0] < frame_width and 0 <= pt[1] < frame_height:
+                        valid_pts.append(pt)
+                if len(valid_pts) > 1:
+                    valid_pts = np.asarray(valid_pts, dtype=np.int32)
+                    overlay = frame.copy()
+                    if len(valid_pts) == 2:
+                        cv2.line(overlay, tuple(valid_pts[0]), tuple(valid_pts[1]), DEFAULT_GROUP_COLOR, 35, lineType=cv2.LINE_AA)
+                    else:
+                        hull = cv2.convexHull(valid_pts)
+                        cv2.fillConvexPoly(overlay, hull, DEFAULT_GROUP_COLOR, lineType=cv2.LINE_AA)
+                        cv2.polylines(overlay, [hull], True, DEFAULT_GROUP_COLOR, 35, lineType=cv2.LINE_AA)
+                    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
 
         for label in unique_labels:
             members = np.where(group_labels == label)[0]
             tid = label_to_tid.get(label)
-            color = colors.get(tid, DEFAULT_GROUP_COLOR)
             pts = np.round(raw_pixels[members]).astype(np.int32)
 
-            for pt in pts:
-                if 0 <= pt[0] < frame_width and 0 <= pt[1] < frame_height:
-                    cv2.circle(frame, tuple(pt), MEMBER_POINT_OUTLINE_RADIUS, (245, 245, 245), -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, tuple(pt), MEMBER_POINT_RADIUS, color, -1, lineType=cv2.LINE_AA)
-
-            if tid is None:
-                continue
-
-            center = label_to_center.get(label, np.mean(corrected_pixels[members], axis=0))
-            center_int = tuple(np.round(center).astype(np.int32))
-
-            hist = np.array(track_history[tid][-TRAIL_LENGTH:], dtype=np.int32)
-            num_segments = len(hist) - 1
-            for j in range(num_segments):
-                p1 = hist[j]
-                p2 = hist[j + 1]
-                if not (0 <= p1[0] < frame_width and 0 <= p1[1] < frame_height and 0 <= p2[0] < frame_width and 0 <= p2[1] < frame_height):
+            for idx, pt in zip(members, pts):
+                if not (0 <= pt[0] < frame_width and 0 <= pt[1] < frame_height):
                     continue
-                frac = (j + 1) / max(num_segments, 1)
-                trail_color = [int(c * frac + 110 * (1 - frac)) for c in color]
-                thickness = int(round(TRAIL_WIDTH_MIN + frac * (TRAIL_WIDTH_MAX - TRAIL_WIDTH_MIN)))
-                cv2.line(frame, tuple(p1), tuple(p2), trail_color, thickness, lineType=cv2.LINE_AA)
 
-            if 0 <= center_int[0] < frame_width and 0 <= center_int[1] < frame_height:
-                cv2.circle(frame, center_int, CENTROID_OUTER_RADIUS, (245, 245, 245), -1, lineType=cv2.LINE_AA)
-                cv2.circle(frame, center_int, CENTROID_INNER_RADIUS, color, -1, lineType=cv2.LINE_AA)
-                label_pos = (center_int[0] + 12, center_int[1] - 10)
-                cv2.putText(frame, str(tid), label_pos, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, (20, 20, 20), LABEL_OUTLINE_THICKNESS, cv2.LINE_AA)
-                cv2.putText(frame, str(tid), label_pos, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, (255, 255, 255), LABEL_TEXT_THICKNESS, cv2.LINE_AA)
+                if tid is not None:
+                    hist_key = f'{int(tid)}_{int(idx)}'
+                    history[hist_key].append((int(pt[0]), int(pt[1])))
+                    pts_hist = np.array(history[hist_key][-TRAIL_LENGTH:], dtype=np.int32)
+                    for j in range(len(pts_hist) - 1):
+                        alpha = (j + 1) / len(pts_hist)
+                        trail_color = [int(c * alpha + 100 * (1 - alpha)) for c in colors[tid]]
+                        cv2.line(frame, tuple(pts_hist[j]), tuple(pts_hist[j + 1]), trail_color, 1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, tuple(pt), 3, colors[tid], -1, lineType=cv2.LINE_AA)
+                    cv2.putText(frame, str(int(tid)), (int(pt[0]) + 5, int(pt[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(frame, tuple(pt), 2, (150, 150, 150), -1, lineType=cv2.LINE_AA)
 
         writer.append_data(frame)
 
