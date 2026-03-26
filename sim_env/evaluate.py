@@ -35,6 +35,54 @@ def unpack_group_offsets(model_out):
     raise ValueError('模型输出缺少 group offset。')
 
 
+def compute_group_shape(points):
+    if len(points) > 1:
+        lower = np.percentile(points, 5, axis=0)
+        upper = np.percentile(points, 95, axis=0)
+        wh = upper - lower
+    else:
+        wh = np.zeros(2, dtype=float)
+    return np.maximum(wh, 3.0)
+
+
+def build_shapes_from_point_labels(points, point_labels, target_ids):
+    if len(target_ids) == 0:
+        return None
+
+    shapes = np.tile(np.array([3.0, 3.0]), (len(target_ids), 1))
+    for i, target_id in enumerate(target_ids):
+        idx = np.where(point_labels == target_id)[0]
+        if len(idx) > 0:
+            shapes[i] = compute_group_shape(points[idx])
+    return shapes
+
+
+def align_predictions_to_dbscan(pred_centers, pred_ids, detected_centroids, centroid_to_points, meas_points, threshold=20.0):
+    point_labels = np.full(len(meas_points), -1)
+    if not isinstance(pred_centers, np.ndarray) or pred_centers.ndim != 2:
+        pred_centers = np.array(pred_centers).reshape(-1, 2)
+
+    pred_shapes = None
+    if len(pred_ids) > 0:
+        pred_shapes = np.tile(np.array([3.0, 3.0]), (len(pred_ids), 1))
+
+    if len(pred_centers) == 0 or len(detected_centroids) == 0:
+        return point_labels, pred_shapes
+
+    det_centroids_arr = np.array(detected_centroids).reshape(-1, 2)
+    cost = euclidean_distances(pred_centers, det_centroids_arr)
+    row_ind, col_ind = linear_sum_assignment(cost)
+
+    for r_i, c_i in zip(row_ind, col_ind):
+        if cost[r_i, c_i] < threshold and c_i in centroid_to_points:
+            point_indices = centroid_to_points[c_i]
+            point_labels[point_indices] = pred_ids[r_i]
+            if pred_shapes is not None:
+                pred_shapes[r_i] = compute_group_shape(meas_points[point_indices])
+
+    return point_labels, pred_shapes
+
+
 def run_evaluation():
     device = torch.device(config.DEVICE)
     print(f"Loading Test Data from {config.DATA_ROOT}...")
@@ -119,13 +167,7 @@ def run_evaluation():
                         det_centers.append(np.mean(corrected_pos[indices], axis=0))
 
                         pts_raw = meas_points[indices]
-                        if len(pts_raw) > 1:
-                            lower = np.percentile(pts_raw, 5, axis=0)
-                            upper = np.percentile(pts_raw, 95, axis=0)
-                            wh = upper - lower
-                        else:
-                            wh = np.array([0.0, 0.0])
-                        det_shapes.append(np.maximum(wh, 3.0))
+                        det_shapes.append(compute_group_shape(pts_raw))
 
                 det_centers = np.array(det_centers).reshape(-1, 2)
                 det_shapes = np.array(det_shapes).reshape(-1, 2)
@@ -149,18 +191,8 @@ def run_evaluation():
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
 
-            gt_shapes_list = []
             pt_lbl = graph.point_labels.cpu().numpy()
-            for gid in gt_ids:
-                idx = np.where(pt_lbl == gid)[0]
-                if len(idx) > 1:
-                    pts = meas_points[idx]
-                    lower = np.percentile(pts, 5, axis=0)
-                    upper = np.percentile(pts, 95, axis=0)
-                    gt_shapes_list.append(np.maximum(upper - lower, 3.0))
-                else:
-                    gt_shapes_list.append(np.array([3.0, 3.0]))
-            gt_shapes_arr = np.array(gt_shapes_list).reshape(-1, 2) if len(gt_shapes_list) > 0 else None
+            gt_shapes_arr = build_shapes_from_point_labels(meas_points, pt_lbl, gt_ids)
 
             metrics['H-GAT-GT (Ours)'].update(
                 gt_centers,
@@ -189,52 +221,80 @@ def run_evaluation():
             t_pre_end = time.time()
             pre_time = t_pre_end - t_pre
 
-            def get_rfs_point_labels(rfs_c, rfs_id):
-                pt_lbl_inner = np.full(len(meas_points), -1)
-                if len(rfs_c) > 0 and len(detected_centroids) > 0:
-                    cost = euclidean_distances(rfs_c, detected_centroids)
-                    r, c = linear_sum_assignment(cost)
-                    for r_i, c_i in zip(r, c):
-                        if cost[r_i, c_i] < 20.0:
-                            tid = rfs_id[r_i]
-                            if c_i in centroid_to_points:
-                                pt_lbl_inner[centroid_to_points[c_i]] = tid
-                return pt_lbl_inner
-
             # --- 2. Baseline ---
             t0 = time.time()
             base_c, base_id, base_pt_lbl = baseline_tracker.step(meas_points)
             t1 = time.time()
+            _, base_shapes = align_predictions_to_dbscan(
+                base_c, base_id, detected_centroids, centroid_to_points, meas_points
+            )
             metrics['Baseline (DBSCAN+KF)'].update_time(t1 - t0)
-            metrics['Baseline (DBSCAN+KF)'].update(gt_centers, gt_ids, base_c, base_id)
-            metrics['Baseline (DBSCAN+KF)'].update_clustering_metrics(graph.point_labels.cpu().numpy(), base_pt_lbl)
+            metrics['Baseline (DBSCAN+KF)'].update(
+                gt_centers,
+                gt_ids,
+                base_c,
+                base_id,
+                gt_shapes=gt_shapes_arr,
+                pred_shapes=base_shapes,
+            )
+            metrics['Baseline (DBSCAN+KF)'].update_clustering_metrics(
+                graph.point_labels.cpu().numpy(), base_pt_lbl
+            )
 
             # --- 3. GM-CPHD ---
             t0 = time.time()
             scphd_c, scphd_id = gm_cphd_tracker.step(detected_centroids)
             t1 = time.time()
+            scphd_pt_lbl, scphd_shapes = align_predictions_to_dbscan(
+                scphd_c, scphd_id, detected_centroids, centroid_to_points, meas_points
+            )
             metrics['GM-CPHD (Standard)'].update_time(t1 - t0 + pre_time)
-            metrics['GM-CPHD (Standard)'].update(gt_centers, gt_ids, scphd_c, scphd_id)
+            metrics['GM-CPHD (Standard)'].update(
+                gt_centers,
+                gt_ids,
+                scphd_c,
+                scphd_id,
+                gt_shapes=gt_shapes_arr,
+                pred_shapes=scphd_shapes,
+            )
             metrics['GM-CPHD (Standard)'].update_clustering_metrics(
-                graph.point_labels.cpu().numpy(), get_rfs_point_labels(scphd_c, scphd_id)
+                graph.point_labels.cpu().numpy(), scphd_pt_lbl
             )
 
             # --- 4. CBMeMBer ---
             t0 = time.time()
             cb_c, cb_id = cbmember_tracker.step(detected_centroids)
             t1 = time.time()
+            cb_pt_lbl, cb_shapes = align_predictions_to_dbscan(
+                cb_c, cb_id, detected_centroids, centroid_to_points, meas_points
+            )
             metrics['CBMeMBer (Standard)'].update_time(t1 - t0 + pre_time)
-            metrics['CBMeMBer (Standard)'].update(gt_centers, gt_ids, cb_c, cb_id)
+            metrics['CBMeMBer (Standard)'].update(
+                gt_centers,
+                gt_ids,
+                cb_c,
+                cb_id,
+                gt_shapes=gt_shapes_arr,
+                pred_shapes=cb_shapes,
+            )
             metrics['CBMeMBer (Standard)'].update_clustering_metrics(
-                graph.point_labels.cpu().numpy(), get_rfs_point_labels(cb_c, cb_id)
+                graph.point_labels.cpu().numpy(), cb_pt_lbl
             )
 
             # --- 5. Graph-MB (Paper) ---
             t0 = time.time()
             gmb_c, gmb_id, gmb_pt_lbl = graph_mb_tracker.step(meas_points)
             t1 = time.time()
+            gmb_shapes = build_shapes_from_point_labels(meas_points, gmb_pt_lbl, gmb_id)
             metrics['Graph-MB (Paper)'].update_time(t1 - t0)
-            metrics['Graph-MB (Paper)'].update(gt_centers, gt_ids, gmb_c, gmb_id)
+            metrics['Graph-MB (Paper)'].update(
+                gt_centers,
+                gt_ids,
+                gmb_c,
+                gmb_id,
+                gt_shapes=gt_shapes_arr,
+                pred_shapes=gmb_shapes,
+            )
             metrics['Graph-MB (Paper)'].update_clustering_metrics(graph.point_labels.cpu().numpy(), gmb_pt_lbl)
 
     final_res = {k: v.compute() for k, v in metrics.items()}
