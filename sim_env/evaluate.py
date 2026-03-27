@@ -138,6 +138,7 @@ def run_evaluation():
             pred_c_gnn, pred_id_gnn = np.array([]), np.array([])
             point_to_track_map_gnn = np.full(len(meas_points), -1)
             pred_shapes_gnn = None
+            pred_shapes_gnn_eval = None
 
             if gnn_model:
                 graph_dev = graph.to(device)
@@ -182,11 +183,13 @@ def run_evaluation():
                 if len(pred_c_gnn) > 0 and len(det_centers) > 0:
                     cost_matrix = euclidean_distances(pred_c_gnn, det_centers)
                     row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                    pred_shapes_gnn_eval = np.tile(np.array([3.0, 3.0]), (len(pred_id_gnn), 1))
                     for r, c in zip(row_ind, col_ind):
                         if cost_matrix[r, c] < 20.0:
                             track_id = pred_id_gnn[r]
                             point_indices = cluster_indices_list[c]
                             point_to_track_map_gnn[point_indices] = track_id
+                            pred_shapes_gnn_eval[r] = det_shapes[c]
 
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
@@ -200,7 +203,7 @@ def run_evaluation():
                 pred_c_gnn,
                 pred_id_gnn,
                 gt_shapes=gt_shapes_arr,
-                pred_shapes=pred_shapes_gnn,
+                pred_shapes=pred_shapes_gnn_eval,
             )
             metrics['H-GAT-GT (Ours)'].update_clustering_metrics(graph.point_labels.cpu().numpy(), point_to_track_map_gnn)
 
