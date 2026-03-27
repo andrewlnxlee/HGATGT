@@ -7,12 +7,13 @@ import config
 from trackers.gnn_processor import GNNPostProcessor
 
 
-GROUP_CLUSTER_EPS = float(getattr(config, 'GROUP_CLUSTER_EPS', 30.0))
-GROUP_CLUSTER_MIN_SAMPLES = int(getattr(config, 'GROUP_CLUSTER_MIN_SAMPLES', 3))
-GROUP_TO_CLUSTER_THRESH = float(getattr(config, 'GROUP_TO_CLUSTER_THRESH', 20.0))
+GROUP_CLUSTER_EPS = float(getattr(config, 'GROUP_CLUSTER_EPS', getattr(config, 'POINT_CLUSTER_EPS', 35.0)))
+GROUP_CLUSTER_MIN_SAMPLES = int(getattr(config, 'GROUP_CLUSTER_MIN_SAMPLES', getattr(config, 'POINT_CLUSTER_MIN_SAMPLES', 3)))
+GROUP_TO_CLUSTER_THRESH = float(getattr(config, 'GROUP_TO_CLUSTER_THRESH', getattr(config, 'GROUP_TO_CENTROID_THRESH', 20.0)))
 POINT_TRACK_STAGE1_THRESHOLD = float(getattr(config, 'POINT_TRACK_STAGE1_THRESHOLD', 20.0))
 POINT_TRACK_RECOVERY_THRESHOLD = float(getattr(config, 'POINT_TRACK_RECOVERY_THRESHOLD', 28.0))
 POINT_TRACK_MAX_AGE = int(getattr(config, 'POINT_TRACK_MAX_AGE', 15))
+GROUP_POINT_MAX_AGE = int(getattr(config, 'GROUP_POINT_MAX_AGE', min(POINT_TRACK_MAX_AGE, 4)))
 
 
 def compute_group_shape(points):
@@ -92,7 +93,7 @@ def project_cluster_tracks_to_points(points, cluster_labels, track_centers, trac
 class GroupConstrainedPointTracker:
     def __init__(
         self,
-        max_age=POINT_TRACK_MAX_AGE,
+        max_age=GROUP_POINT_MAX_AGE,
         stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
         stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
     ):

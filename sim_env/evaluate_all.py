@@ -24,6 +24,7 @@ from trackers.gnn_processor_all import (
     build_group_detections,
     compute_group_shape,
     project_cluster_tracks_to_points,
+    assign_track_ids_to_points,
 )
 from trackers.graph_mb import GraphMBTracker
 
@@ -161,8 +162,92 @@ def update_point_metrics(metric, gt_pos, gt_ids, pred_pos, pred_ids):
     metric.update(gt_pos, gt_ids, pred_pos, pred_ids)
 
 
-def run_hgat_tracker(processor, group_corrected_points, point_corrected_points):
-    return processor.update_all(group_corrected_points, point_corrected_points)
+def build_pred_shapes_from_group_alignment(pred_group_centers, detected_centers, detected_shapes, match_thresh=GROUP_TO_CLUSTER_THRESH):
+    pred_group_centers = np.asarray(pred_group_centers, dtype=float).reshape(-1, 2)
+    detected_centers = np.asarray(detected_centers, dtype=float).reshape(-1, 2)
+    if len(pred_group_centers) == 0:
+        return None
+
+    pred_shapes = np.tile(np.array([3.0, 3.0]), (len(pred_group_centers), 1))
+    if detected_shapes is None or len(detected_centers) == 0:
+        return pred_shapes
+
+    detected_shapes = np.asarray(detected_shapes, dtype=float).reshape(-1, 2)
+    cost = euclidean_distances(pred_group_centers, detected_centers)
+    row_ind, col_ind = linear_sum_assignment(cost)
+    for r, c in zip(row_ind, col_ind):
+        if cost[r, c] < match_thresh:
+            pred_shapes[r] = detected_shapes[c]
+    return pred_shapes
+
+
+def filter_clustered_points(points, eps=config.POINT_CLUSTER_EPS, min_samples=config.POINT_CLUSTER_MIN_SAMPLES):
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    cluster_labels, _, _, _ = build_group_detections(points, eps=eps, min_samples=min_samples)
+    keep_mask = cluster_labels != -1
+    filtered_points = points[keep_mask]
+    return filtered_points, keep_mask, cluster_labels
+
+
+def run_hgat_tracker(processor, group_corrected_points, point_corrected_points, meas_points):
+    group_corrected_points = np.asarray(group_corrected_points, dtype=float).reshape(-1, 2)
+    point_corrected_points = np.asarray(point_corrected_points, dtype=float).reshape(-1, 2)
+    meas_points = np.asarray(meas_points, dtype=float).reshape(-1, 2)
+
+    group_out = processor.update_group_tracks(group_corrected_points)
+
+    point_stage_points = point_corrected_points
+    if len(point_stage_points) > 0:
+        point_stage_points, keep_mask, _ = filter_clustered_points(point_stage_points)
+        if len(point_stage_points) > 0:
+            _, point_detected_centers, point_centroid_to_points, _ = build_group_detections(
+                point_stage_points,
+                eps=config.POINT_CLUSTER_EPS,
+                min_samples=config.POINT_CLUSTER_MIN_SAMPLES,
+            )
+            point_group_ids = assign_track_ids_to_points(
+                group_out['group_centers'],
+                group_out['group_ids'],
+                point_detected_centers,
+                point_centroid_to_points,
+                len(point_stage_points),
+                GROUP_TO_CLUSTER_THRESH,
+            )
+        else:
+            point_group_ids = np.zeros((0,), dtype=int)
+    else:
+        keep_mask = np.zeros((0,), dtype=bool)
+        point_group_ids = np.zeros((0,), dtype=int)
+
+    point_out = processor.update_point_tracks(point_stage_points, point_group_ids)
+
+    point_group_ids_eval = assign_track_ids_to_points(
+        group_out['group_centers'],
+        group_out['group_ids'],
+        group_out['detected_centers'],
+        group_out['centroid_to_points'],
+        len(meas_points),
+        GROUP_TO_CLUSTER_THRESH,
+    )
+    detected_shapes_eval = None
+    if len(group_out['centroid_to_points']) > 0:
+        detected_shapes_eval = []
+        for det_idx in sorted(group_out['centroid_to_points'].keys()):
+            detected_shapes_eval.append(compute_group_shape(meas_points[group_out['centroid_to_points'][det_idx]]))
+        detected_shapes_eval = np.asarray(detected_shapes_eval, dtype=float).reshape(-1, 2)
+
+    pred_group_shapes_eval = build_pred_shapes_from_group_alignment(
+        group_out['group_centers'],
+        group_out['detected_centers'],
+        detected_shapes_eval,
+    )
+
+    return {
+        **group_out,
+        **point_out,
+        'point_group_ids_eval': point_group_ids_eval,
+        'pred_group_shapes_eval': pred_group_shapes_eval,
+    }
 
 
 def run_baseline_tracker(group_tracker, point_tracker, meas_points):
@@ -308,7 +393,7 @@ def run_evaluation():
             # H-GAT-GT
             t0 = time.time()
             group_corrected_points, point_corrected_points = infer_dual_corrected_points(gnn_model, graph, meas_points, device)
-            hgat_out = run_hgat_tracker(hgat_processor, group_corrected_points, point_corrected_points)
+            hgat_out = run_hgat_tracker(hgat_processor, group_corrected_points, point_corrected_points, meas_points)
             t1 = time.time()
             metrics_group['H-GAT-GT (Ours)'].update_time(t1 - t0)
             metrics_point['H-GAT-GT (Ours)'].update_time(t1 - t0)
@@ -319,9 +404,9 @@ def run_evaluation():
                 hgat_out['group_centers'],
                 hgat_out['group_ids'],
                 gt_group_shapes,
-                hgat_out['group_shapes'],
+                hgat_out['pred_group_shapes_eval'],
                 gt_point_labels,
-                hgat_out['point_group_ids'],
+                hgat_out['point_group_ids_eval'],
             )
             update_point_metrics(
                 metrics_point['H-GAT-GT (Ours)'],
