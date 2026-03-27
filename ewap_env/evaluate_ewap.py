@@ -130,8 +130,7 @@ def evaluate_scene(scene_name, scene_folder, gnn_model, device):
             # ========================
             # 其他算法 (Baseline, RFS, etc.)
             # ========================
-            # 预处理
-            t_pre = time.time()
+            # 预处理（共享 DBSCAN 时间不计入各算法 Time）
             base_dets, base_map = [], {}
             if len(meas_points_2d) > 0:
                 dbl = DBSCAN(eps=35, min_samples=1).fit_predict(meas_points_2d)
@@ -139,27 +138,30 @@ def evaluate_scene(scene_name, scene_folder, gnn_model, device):
                     idx = np.where(dbl == l)[0]
                     base_dets.append(np.mean(meas_points_2d[idx], axis=0))
                     base_map[i] = idx
-            pre_time = time.time() - t_pre
 
             # Baseline
             t0 = time.time()
             bc, bid, bmap = trackers['Baseline'].step(meas_points_2d)
+            metrics['Baseline'].update_time(time.time() - t0)
             metrics['Baseline'].update(gt_centers, gt_ids, bc, bid)
             metrics['Baseline'].update_clustering_metrics(pt_lbl, bmap)
 
             # GM-CPHD
             t0 = time.time()
             cc, cid = trackers['GM-CPHD'].step(base_dets)
+            metrics['GM-CPHD'].update_time(time.time() - t0)
             metrics['GM-CPHD'].update(gt_centers, gt_ids, cc, cid)
-            
+
             # CBMeMBer
             t0 = time.time()
             cb_c, cb_id = trackers['CBMeMBer'].step(base_dets)
+            metrics['CBMeMBer'].update_time(time.time() - t0)
             metrics['CBMeMBer'].update(gt_centers, gt_ids, cb_c, cb_id)
-            
+
             # Graph-MB
             t0 = time.time()
             gmb_c, gmb_id, gmb_lbl = trackers['Graph-MB'].step(meas_points_2d)
+            metrics['Graph-MB'].update_time(time.time() - t0)
             metrics['Graph-MB'].update(gt_centers, gt_ids, gmb_c, gmb_id)
             metrics['Graph-MB'].update_clustering_metrics(pt_lbl, gmb_lbl)
 
