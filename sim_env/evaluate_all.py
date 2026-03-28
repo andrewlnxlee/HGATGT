@@ -196,25 +196,8 @@ def run_hgat_tracker(processor, group_corrected_points, point_corrected_points, 
 
     group_out = processor.update_group_tracks(group_corrected_points)
 
-    filtered_point_points, _, _ = filter_clustered_points(point_corrected_points)
-    if len(filtered_point_points) > 0:
-        point_cluster_labels, point_det_centers, _, point_det_shapes = build_group_detections(
-            filtered_point_points,
-            eps=config.POINT_CLUSTER_EPS,
-            min_samples=config.POINT_CLUSTER_MIN_SAMPLES,
-        )
-        if len(point_det_centers) > 0:
-            point_group_centers, point_group_ids, _ = processor.group_tracker.update(point_det_centers, point_det_shapes)
-        else:
-            point_group_centers, point_group_ids, _ = processor.group_tracker.update(np.empty((0, 2)), None)
-        point_group_ids_for_points = project_cluster_tracks_to_points(
-            filtered_point_points,
-            point_cluster_labels,
-            point_group_centers,
-            point_group_ids,
-        )
-    else:
-        point_group_ids_for_points = np.zeros((0,), dtype=int)
+    filtered_point_points, point_keep_mask, _ = filter_clustered_points(point_corrected_points)
+    point_group_ids_for_points = group_out['point_group_ids'][point_keep_mask]
 
     point_out = processor.update_point_tracks(filtered_point_points, point_group_ids_for_points)
 
