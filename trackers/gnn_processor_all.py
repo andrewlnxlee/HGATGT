@@ -135,6 +135,9 @@ class GroupConstrainedPointTracker:
             trk['P'] = self.F @ trk['P'] @ self.F.T + self.Q
             trk['age'] += 1
 
+        valid_mask = group_ids >= 0
+        points = points[valid_mask]
+        group_ids = group_ids[valid_mask]
         valid_group_ids = sorted(int(gid) for gid in np.unique(group_ids) if gid >= 0)
         for gid in valid_group_ids:
             det_indices = np.where(group_ids == gid)[0]

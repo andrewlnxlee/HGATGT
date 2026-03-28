@@ -253,7 +253,9 @@ def run_hgat_tracker(processor, group_corrected_points, point_corrected_points, 
 def run_baseline_tracker(group_tracker, point_tracker, meas_points):
     group_centers, group_ids, cluster_labels = group_tracker.step(meas_points)
     point_group_ids = project_cluster_tracks_to_points(meas_points, cluster_labels, group_centers, group_ids)
-    point_positions, point_ids = point_tracker.update(meas_points, point_group_ids)
+    filtered_points, keep_mask, _ = filter_clustered_points(meas_points)
+    filtered_group_ids = point_group_ids[keep_mask]
+    point_positions, point_ids = point_tracker.update(filtered_points, filtered_group_ids)
     group_shapes = build_shapes_from_point_labels(meas_points, point_group_ids, group_ids)
     return {
         'group_centers': np.asarray(group_centers, dtype=float).reshape(-1, 2),
@@ -285,7 +287,9 @@ def run_rfs_tracker(group_tracker, point_tracker, detected_centers, detected_sha
             if c in centroid_to_points:
                 point_group_ids[centroid_to_points[c]] = group_ids[r]
 
-    point_positions, point_ids = point_tracker.update(meas_points, point_group_ids)
+    filtered_points, keep_mask, _ = filter_clustered_points(meas_points)
+    filtered_group_ids = point_group_ids[keep_mask]
+    point_positions, point_ids = point_tracker.update(filtered_points, filtered_group_ids)
     group_shapes = build_shapes_from_point_labels(meas_points, point_group_ids, group_ids)
     return {
         'group_centers': group_centers,
@@ -299,7 +303,9 @@ def run_rfs_tracker(group_tracker, point_tracker, detected_centers, detected_sha
 
 def run_graph_mb_tracker(group_tracker, point_tracker, meas_points):
     group_centers, group_ids, point_group_ids = group_tracker.step(meas_points)
-    point_positions, point_ids = point_tracker.update(meas_points, point_group_ids)
+    filtered_points, keep_mask, _ = filter_clustered_points(meas_points)
+    filtered_group_ids = np.asarray(point_group_ids, dtype=int).reshape(-1)[keep_mask]
+    point_positions, point_ids = point_tracker.update(filtered_points, filtered_group_ids)
     group_shapes = build_shapes_from_point_labels(meas_points, point_group_ids, group_ids)
     return {
         'group_centers': np.asarray(group_centers, dtype=float).reshape(-1, 2),
