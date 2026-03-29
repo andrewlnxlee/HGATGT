@@ -97,15 +97,65 @@ class GroupConstrainedPointTracker:
         stage1_thresh=POINT_TRACK_STAGE1_THRESHOLD,
         stage2_thresh=POINT_TRACK_RECOVERY_THRESHOLD,
     ):
-        self.max_age = max_age
-        self.stage1_thresh = stage1_thresh
-        self.stage2_thresh = stage2_thresh
-        self.match_threshold = stage2_thresh
+        self.max_age = int(max_age)
+        self.stage1_thresh = float(stage1_thresh)
+        self.stage2_thresh = float(stage2_thresh)
+
+        # 6D constant-acceleration KF: [x, y, vx, vy, ax, ay]
+        dt = 1.0
+        self.F = np.array(
+            [
+                [1, 0, dt, 0, 0.5 * dt ** 2, 0],
+                [0, 1, 0, dt, 0, 0.5 * dt ** 2],
+                [0, 0, 1, 0, dt, 0],
+                [0, 0, 0, 1, 0, dt],
+                [0, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 0, 1],
+            ],
+            dtype=float,
+        )
+        self.H = np.array([[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]], dtype=float)
+
+        # Keep consistent with trackers/gnn_processor_single.py
+        self.R = np.eye(2, dtype=float) * 25.0
+        self.Q = np.diag([0.05, 0.05, 0.05, 0.05, 0.1, 0.1]).astype(float)
+        self.P_init = np.diag([20.0, 20.0, 200.0, 200.0, 600.0, 600.0]).astype(float)
+
         self.reset()
 
     def reset(self):
         self.tracks = {}
         self.next_id = 1
+
+    def _predict_track(self, trk):
+        # Damping for aged tracks to avoid drift explosion.
+        if trk['age'] > 0:
+            trk['x'][4:] *= 0.5
+            trk['x'][2:4] *= 0.9
+        trk['x'] = self.F @ trk['x']
+        trk['P'] = self.F @ trk['P'] @ self.F.T + self.Q
+        trk['age'] += 1
+
+    def _update_track(self, trk, z):
+        z = np.asarray(z, dtype=float).reshape(2,)
+        y = z - self.H @ trk['x']
+        S = self.H @ trk['P'] @ self.H.T + self.R
+        K = trk['P'] @ self.H.T @ np.linalg.inv(S)
+        trk['x'] = trk['x'] + K @ y
+        trk['P'] = (np.eye(6, dtype=float) - K @ self.H) @ trk['P']
+        trk['age'] = 0
+        trk['last_meas'] = z
+
+    def _create_track(self, tid, z, gid):
+        z = np.asarray(z, dtype=float).reshape(2,)
+        self.tracks[int(tid)] = {
+            'x': np.zeros(6, dtype=float),
+            'P': self.P_init.copy(),
+            'age': 0,
+            'group_id': int(gid),
+            'last_meas': z,
+        }
+        self.tracks[int(tid)]['x'][:2] = z
 
     def update(self, points, group_ids):
         points = np.asarray(points, dtype=float).reshape(-1, 2)
@@ -113,13 +163,15 @@ class GroupConstrainedPointTracker:
         if len(points) != len(group_ids):
             raise ValueError(f'points/group_ids 数量不一致: {len(points)} vs {len(group_ids)}')
 
+        # 1) Predict all existing tracks
         for trk in self.tracks.values():
-            trk['pred_pos'] = trk['pos'] + trk['vel']
-            trk['age'] += 1
+            self._predict_track(trk)
 
+        # 2) Only associate points with valid group ids
         valid_mask = group_ids >= 0
         points = points[valid_mask]
         group_ids = group_ids[valid_mask]
+
         valid_group_ids = sorted(int(gid) for gid in np.unique(group_ids) if gid >= 0)
         for gid in valid_group_ids:
             det_indices = np.where(group_ids == gid)[0]
@@ -127,52 +179,54 @@ class GroupConstrainedPointTracker:
                 continue
 
             track_ids = [tid for tid, trk in self.tracks.items() if trk['group_id'] == gid]
-            matched_det_indices = set()
+            unmatched_dets = set(int(i) for i in det_indices)
+            unmatched_trks = set(int(tid) for tid in track_ids)
 
-            if track_ids:
-                pred_pos = np.array([self.tracks[tid]['pred_pos'] for tid in track_ids], dtype=float).reshape(-1, 2)
-                det_points = points[det_indices]
-                cost = euclidean_distances(pred_pos, det_points)
-                row_ind, col_ind = linear_sum_assignment(cost)
+            def associate(thresh, t_set, d_set):
+                if not t_set or not d_set:
+                    return
+                t_ids = list(t_set)
+                d_ids = list(d_set)
+
+                t_pos = np.asarray([self.tracks[tid]['x'][:2] for tid in t_ids], dtype=float).reshape(-1, 2)
+                d_pos = points[d_ids]
+                dist_cost = euclidean_distances(t_pos, d_pos)
+                row_ind, col_ind = linear_sum_assignment(dist_cost)
 
                 for r, c in zip(row_ind, col_ind):
-                    if cost[r, c] >= self.match_threshold:
+                    if dist_cost[r, c] >= thresh:
                         continue
-                    tid = track_ids[r]
-                    det_idx = det_indices[c]
+                    tid = t_ids[r]
+                    did = d_ids[c]
                     trk = self.tracks[tid]
-                    new_pos = points[det_idx]
-                    displacement = new_pos - trk['pos']
-                    trk['vel'] = 0.5 * trk['vel'] + 0.5 * displacement
-                    trk['pos'] = new_pos
-                    trk['pred_pos'] = new_pos
+                    if trk['age'] > 1:
+                        trk['P'] = self.P_init.copy()
+                    self._update_track(trk, points[did])
                     trk['group_id'] = gid
-                    trk['age'] = 0
-                    matched_det_indices.add(det_idx)
+                    unmatched_trks.discard(tid)
+                    unmatched_dets.discard(did)
 
-            for det_idx in det_indices:
-                if det_idx in matched_det_indices:
-                    continue
-                self.tracks[self.next_id] = {
-                    'pos': points[det_idx].copy(),
-                    'pred_pos': points[det_idx].copy(),
-                    'vel': np.zeros(2, dtype=float),
-                    'group_id': gid,
-                    'age': 0,
-                }
+            associate(self.stage1_thresh, unmatched_trks, unmatched_dets)
+            associate(self.stage2_thresh, unmatched_trks, unmatched_dets)
+
+            # 3) Spawn tracks for unmatched detections
+            for did in sorted(unmatched_dets):
+                self._create_track(self.next_id, points[did], gid)
                 self.next_id += 1
 
+        # 4) Remove stale tracks
         stale_ids = [tid for tid, trk in self.tracks.items() if trk['age'] > self.max_age]
         for tid in stale_ids:
             del self.tracks[tid]
 
+        # 5) Output tracks updated this frame
         active_ids = sorted(tid for tid, trk in self.tracks.items() if trk['age'] == 0)
         if not active_ids:
             return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=int)
 
-        pred_points = np.array([self.tracks[tid]['pos'] for tid in active_ids], dtype=float).reshape(-1, 2)
-        pred_ids = np.array(active_ids, dtype=int)
-        return pred_points, pred_ids
+        point_positions = np.asarray([self.tracks[tid]['last_meas'] for tid in active_ids], dtype=float).reshape(-1, 2)
+        point_ids = np.asarray(active_ids, dtype=int)
+        return point_positions, point_ids
 
 
 class HierarchicalTrackProcessor:

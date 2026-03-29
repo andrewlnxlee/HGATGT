@@ -115,9 +115,8 @@ class GNNPostProcessor:
         trk['age'] = 0; trk['last_meas'] = pos
         
         if shape is not None:
-            # --- 关键修改：加快形状的学习率 ---
-            # 从 0.9/0.1 改为 0.5/0.5，快速适应群的变大变小
-            trk['shape'] = 0.5 * trk['shape'] + 0.5 * shape
+            # 形状来自簇内点集（由调用方计算），这里直接跟随当前帧的测量值，避免 EMA 滞后影响关联。
+            trk['shape'] = np.asarray(shape, dtype=float).reshape(2,)
             
         trk['trace'].append(pos)
         if len(trk['trace']) > 50: trk['trace'].pop(0)
