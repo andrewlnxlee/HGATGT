@@ -30,8 +30,10 @@ from trackers.graph_mb import GraphMBTracker
 
 
 POINT_OSPA_C = 25.0
-POINT_MATCH_THRESHOLD = float(getattr(config, 'POINT_MATCH_THRESHOLD', getattr(config, 'POINT_TRACK_RECOVERY_THRESHOLD', 28.0)))
-POINT_ID_SWITCH_GAP_TOLERANCE = getattr(config, 'POINT_ID_SWITCH_GAP_TOLERANCE', 0)
+POINT_MATCH_THRESHOLD = float(getattr(config, 'POINT_MATCH_THRESHOLD', 35.0))
+POINT_ID_SWITCH_GAP_TOLERANCE = int(getattr(config, 'POINT_ID_SWITCH_GAP_TOLERANCE', 3))
+GROUP_ID_SWITCH_GAP_TOLERANCE = int(getattr(config, 'GROUP_ID_SWITCH_GAP_TOLERANCE', 3))
+GROUP_MATCH_THRESHOLD = float(getattr(config, 'GROUP_MATCH_THRESHOLD', 40.0))
 ENABLE_POINT_UNCERTAINTY_GATING = bool(getattr(config, 'ENABLE_POINT_UNCERTAINTY_GATING', False))
 
 
@@ -135,7 +137,10 @@ def infer_dual_corrected_points(gnn_model, graph, meas_points, device):
 
 
 def create_group_metrics():
-    return TrackingMetrics()
+    return TrackingMetrics(
+        match_threshold=GROUP_MATCH_THRESHOLD,
+        id_switch_gap_tolerance=GROUP_ID_SWITCH_GAP_TOLERANCE,
+    )
 
 
 def create_point_metrics():

@@ -219,12 +219,21 @@ class GroupConstrainedPointTracker:
         for tid in stale_ids:
             del self.tracks[tid]
 
-        # 5) Output tracks updated this frame
-        active_ids = sorted(tid for tid, trk in self.tracks.items() if trk['age'] == 0)
+        # 5) Output tracks: include recently coasted (age <= 1) to bridge
+        #    short observation gaps and prevent spurious IDSW in evaluation.
+        active_ids = sorted(tid for tid, trk in self.tracks.items() if trk['age'] <= 1)
         if not active_ids:
             return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=int)
 
-        point_positions = np.asarray([self.tracks[tid]['last_meas'] for tid in active_ids], dtype=float).reshape(-1, 2)
+        positions = []
+        for tid in active_ids:
+            trk = self.tracks[tid]
+            if trk['age'] == 0:
+                positions.append(trk['last_meas'])
+            else:
+                # Use KF predicted position for coasted tracks
+                positions.append(trk['x'][:2].copy())
+        point_positions = np.asarray(positions, dtype=float).reshape(-1, 2)
         point_ids = np.asarray(active_ids, dtype=int)
         return point_positions, point_ids
 
