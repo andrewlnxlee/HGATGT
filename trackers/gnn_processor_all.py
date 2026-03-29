@@ -172,54 +172,79 @@ class GroupConstrainedPointTracker:
         points = points[valid_mask]
         group_ids = group_ids[valid_mask]
 
+        matched_trks = set()
+        matched_dets = set()
+
+        # 3) Per-group association (stage 1 + stage 2)
         valid_group_ids = sorted(int(gid) for gid in np.unique(group_ids) if gid >= 0)
         for gid in valid_group_ids:
-            det_indices = np.where(group_ids == gid)[0]
-            if len(det_indices) == 0:
+            det_indices = [int(i) for i in np.where(group_ids == gid)[0] if int(i) not in matched_dets]
+            track_ids = [tid for tid, trk in self.tracks.items()
+                         if trk['group_id'] == gid and tid not in matched_trks]
+            if not det_indices or not track_ids:
                 continue
 
-            track_ids = [tid for tid, trk in self.tracks.items() if trk['group_id'] == gid]
-            unmatched_dets = set(int(i) for i in det_indices)
-            unmatched_trks = set(int(tid) for tid in track_ids)
+            for thresh in (self.stage1_thresh, self.stage2_thresh):
+                avail_trks = [tid for tid in track_ids if tid not in matched_trks]
+                avail_dets = [did for did in det_indices if did not in matched_dets]
+                if not avail_trks or not avail_dets:
+                    break
 
-            def associate(thresh, t_set, d_set):
-                if not t_set or not d_set:
-                    return
-                t_ids = list(t_set)
-                d_ids = list(d_set)
-
-                t_pos = np.asarray([self.tracks[tid]['x'][:2] for tid in t_ids], dtype=float).reshape(-1, 2)
-                d_pos = points[d_ids]
+                t_pos = np.asarray([self.tracks[tid]['x'][:2] for tid in avail_trks], dtype=float).reshape(-1, 2)
+                d_pos = points[avail_dets]
                 dist_cost = euclidean_distances(t_pos, d_pos)
                 row_ind, col_ind = linear_sum_assignment(dist_cost)
 
                 for r, c in zip(row_ind, col_ind):
                     if dist_cost[r, c] >= thresh:
                         continue
-                    tid = t_ids[r]
-                    did = d_ids[c]
+                    tid = avail_trks[r]
+                    did = avail_dets[c]
                     trk = self.tracks[tid]
                     if trk['age'] > 1:
                         trk['P'] = self.P_init.copy()
                     self._update_track(trk, points[did])
                     trk['group_id'] = gid
-                    unmatched_trks.discard(tid)
-                    unmatched_dets.discard(did)
+                    matched_trks.add(tid)
+                    matched_dets.add(did)
 
-            associate(self.stage1_thresh, unmatched_trks, unmatched_dets)
-            associate(self.stage2_thresh, unmatched_trks, unmatched_dets)
+        # 4) Cross-group recovery: match remaining unmatched detections
+        #    against ALL remaining tracks regardless of group assignment.
+        #    This prevents spurious IDSW when a point's group assignment
+        #    changes between frames (e.g. due to clustering instability).
+        remaining_dets = sorted(set(range(len(points))) - matched_dets)
+        remaining_trks = sorted(set(self.tracks.keys()) - matched_trks)
 
-            # 3) Spawn tracks for unmatched detections
-            for did in sorted(unmatched_dets):
-                self._create_track(self.next_id, points[did], gid)
-                self.next_id += 1
+        if remaining_dets and remaining_trks:
+            t_pos = np.asarray([self.tracks[tid]['x'][:2] for tid in remaining_trks], dtype=float).reshape(-1, 2)
+            d_pos = points[remaining_dets]
+            dist_cost = euclidean_distances(t_pos, d_pos)
+            row_ind, col_ind = linear_sum_assignment(dist_cost)
 
-        # 4) Remove stale tracks
+            for r, c in zip(row_ind, col_ind):
+                if dist_cost[r, c] >= self.stage2_thresh:
+                    continue
+                tid = remaining_trks[r]
+                did = remaining_dets[c]
+                trk = self.tracks[tid]
+                if trk['age'] > 1:
+                    trk['P'] = self.P_init.copy()
+                self._update_track(trk, points[did])
+                trk['group_id'] = int(group_ids[did])
+                matched_trks.add(tid)
+                matched_dets.add(did)
+
+        # 5) Spawn tracks for still-unmatched detections
+        for did in sorted(set(range(len(points))) - matched_dets):
+            self._create_track(self.next_id, points[did], int(group_ids[did]))
+            self.next_id += 1
+
+        # 6) Remove stale tracks
         stale_ids = [tid for tid, trk in self.tracks.items() if trk['age'] > self.max_age]
         for tid in stale_ids:
             del self.tracks[tid]
 
-        # 5) Output tracks updated this frame
+        # 7) Output tracks updated this frame
         active_ids = sorted(tid for tid, trk in self.tracks.items() if trk['age'] == 0)
         if not active_ids:
             return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=int)
