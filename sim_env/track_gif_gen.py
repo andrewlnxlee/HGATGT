@@ -65,6 +65,9 @@ VIZ_STYLE = {
     'merge_marker_outer_size': 84,
     'merge_marker_inner_size': 42,
     'merge_bridge_width_boost': 1.1,
+    'merge_arrow_width': 3.2,
+    'merge_arrow_head_scale': 24,
+    'merge_arrow_outline_width': 5.0,
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -499,45 +502,6 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     style_axes(ax)
 
     merge_endpoints = {}
-    for bridge in overview_bridges:
-        child_track = overview_tracks.get(bridge['child_id'])
-        color = child_track['color'] if child_track is not None else get_track_color(bridge['child_id'])
-        bridge_alpha = VIZ_STYLE['bridge_alpha'] * (0.95 if bridge['type'] == 'merge' else 0.80)
-        bridge_width = VIZ_STYLE['bridge_width'] + (VIZ_STYLE['merge_bridge_width_boost'] if bridge['type'] == 'merge' else 0.0)
-        if bridge['type'] == 'merge':
-            ax.annotate(
-                '',
-                xy=(bridge['end'][0], bridge['end'][1]),
-                xytext=(bridge['start'][0], bridge['start'][1]),
-                arrowprops=dict(
-                    arrowstyle='-|>',
-                    color=mcolors.to_rgba(color, bridge_alpha),
-                    lw=bridge_width,
-                    linestyle='--',
-                    shrinkA=0,
-                    shrinkB=0,
-                    mutation_scale=14,
-                ),
-                zorder=1,
-            )
-        else:
-            ax.plot(
-                [bridge['start'][0], bridge['end'][0]],
-                [bridge['start'][1], bridge['end'][1]],
-                color=mcolors.to_rgba(color, bridge_alpha),
-                linewidth=bridge_width,
-                linestyle='--',
-                solid_capstyle='round',
-                zorder=1,
-            )
-        if bridge['type'] == 'merge':
-            key = tuple(np.round(bridge['end'], 4))
-            merge_endpoints.setdefault(key, {
-                'point': np.asarray(bridge['end'], dtype=float),
-                'color': color,
-                'count': 0,
-            })
-            merge_endpoints[key]['count'] += 1
 
     for track_id in sorted(overview_tracks):
         track_info = overview_tracks[track_id]
@@ -593,6 +557,57 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             ),
             zorder=6,
         )
+
+    for bridge in overview_bridges:
+        child_track = overview_tracks.get(bridge['child_id'])
+        color = child_track['color'] if child_track is not None else get_track_color(bridge['child_id'])
+        bridge_alpha = VIZ_STYLE['bridge_alpha'] * (0.95 if bridge['type'] == 'merge' else 0.80)
+        if bridge['type'] == 'merge':
+            ax.annotate(
+                '',
+                xy=(bridge['end'][0], bridge['end'][1]),
+                xytext=(bridge['start'][0], bridge['start'][1]),
+                arrowprops=dict(
+                    arrowstyle='-|>',
+                    color=mcolors.to_rgba('white', 0.96),
+                    lw=VIZ_STYLE['merge_arrow_outline_width'],
+                    shrinkA=0,
+                    shrinkB=0,
+                    mutation_scale=VIZ_STYLE['merge_arrow_head_scale'],
+                ),
+                zorder=6,
+            )
+            ax.annotate(
+                '',
+                xy=(bridge['end'][0], bridge['end'][1]),
+                xytext=(bridge['start'][0], bridge['start'][1]),
+                arrowprops=dict(
+                    arrowstyle='-|>',
+                    color=mcolors.to_rgba(color, bridge_alpha),
+                    lw=VIZ_STYLE['merge_arrow_width'],
+                    shrinkA=0,
+                    shrinkB=0,
+                    mutation_scale=VIZ_STYLE['merge_arrow_head_scale'],
+                ),
+                zorder=7,
+            )
+            key = tuple(np.round(bridge['end'], 4))
+            merge_endpoints.setdefault(key, {
+                'point': np.asarray(bridge['end'], dtype=float),
+                'color': color,
+                'count': 0,
+            })
+            merge_endpoints[key]['count'] += 1
+        else:
+            ax.plot(
+                [bridge['start'][0], bridge['end'][0]],
+                [bridge['start'][1], bridge['end'][1]],
+                color=mcolors.to_rgba(color, bridge_alpha),
+                linewidth=VIZ_STYLE['bridge_width'],
+                linestyle='--',
+                solid_capstyle='round',
+                zorder=6,
+            )
 
     for merge_info in merge_endpoints.values():
         if merge_info['count'] < 2:
