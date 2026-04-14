@@ -62,6 +62,9 @@ VIZ_STYLE = {
     'bridge_frames': 6,
     'bridge_alpha': 0.52,
     'bridge_width': 1.5,
+    'merge_marker_outer_size': 84,
+    'merge_marker_inner_size': 42,
+    'merge_bridge_width_boost': 1.1,
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -479,6 +482,7 @@ def collect_overview_tracks(viz_frames):
                     'end': np.asarray(bridge['end'], dtype=float),
                     'type': bridge['type'],
                     'child_id': track_id,
+                    'start_frame': bridge['start_frame'],
                 }
 
     return overview_tracks, list(overview_bridges.values())
@@ -491,21 +495,49 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
 
     fig, ax = plt.subplots(figsize=VIZ_STYLE['figsize'], dpi=VIZ_STYLE['dpi'])
     fig.patch.set_facecolor(VIZ_STYLE['background'])
-    fig.subplots_adjust(left=0.11, right=0.97, bottom=0.10, top=0.92)
+    fig.subplots_adjust(left=0.11, right=0.97, bottom=0.10, top=0.97)
     style_axes(ax)
 
+    merge_endpoints = {}
     for bridge in overview_bridges:
         child_track = overview_tracks.get(bridge['child_id'])
         color = child_track['color'] if child_track is not None else get_track_color(bridge['child_id'])
-        ax.plot(
-            [bridge['start'][0], bridge['end'][0]],
-            [bridge['start'][1], bridge['end'][1]],
-            color=mcolors.to_rgba(color, VIZ_STYLE['bridge_alpha'] * 0.85),
-            linewidth=VIZ_STYLE['bridge_width'],
-            linestyle='--',
-            solid_capstyle='round',
-            zorder=1,
-        )
+        bridge_alpha = VIZ_STYLE['bridge_alpha'] * (0.95 if bridge['type'] == 'merge' else 0.80)
+        bridge_width = VIZ_STYLE['bridge_width'] + (VIZ_STYLE['merge_bridge_width_boost'] if bridge['type'] == 'merge' else 0.0)
+        if bridge['type'] == 'merge':
+            ax.annotate(
+                '',
+                xy=(bridge['end'][0], bridge['end'][1]),
+                xytext=(bridge['start'][0], bridge['start'][1]),
+                arrowprops=dict(
+                    arrowstyle='-|>',
+                    color=mcolors.to_rgba(color, bridge_alpha),
+                    lw=bridge_width,
+                    linestyle='--',
+                    shrinkA=0,
+                    shrinkB=0,
+                    mutation_scale=14,
+                ),
+                zorder=1,
+            )
+        else:
+            ax.plot(
+                [bridge['start'][0], bridge['end'][0]],
+                [bridge['start'][1], bridge['end'][1]],
+                color=mcolors.to_rgba(color, bridge_alpha),
+                linewidth=bridge_width,
+                linestyle='--',
+                solid_capstyle='round',
+                zorder=1,
+            )
+        if bridge['type'] == 'merge':
+            key = tuple(np.round(bridge['end'], 4))
+            merge_endpoints.setdefault(key, {
+                'point': np.asarray(bridge['end'], dtype=float),
+                'color': color,
+                'count': 0,
+            })
+            merge_endpoints[key]['count'] += 1
 
     for track_id in sorted(overview_tracks):
         track_info = overview_tracks[track_id]
@@ -562,6 +594,29 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             zorder=6,
         )
 
+    for merge_info in merge_endpoints.values():
+        if merge_info['count'] < 2:
+            continue
+        point = merge_info['point']
+        color = merge_info['color']
+        ax.scatter(
+            point[0], point[1],
+            s=VIZ_STYLE['merge_marker_outer_size'],
+            color='white',
+            edgecolors='none',
+            alpha=0.92,
+            zorder=6,
+        )
+        ax.scatter(
+            point[0], point[1],
+            s=VIZ_STYLE['merge_marker_inner_size'],
+            color=color,
+            marker='P',
+            edgecolors='white',
+            linewidths=0.8,
+            zorder=7,
+        )
+
     info_text = (
         f'{labels["frame"]}: 00-{len(viz_frames) - 1:02d}\n'
         f'{labels["active_groups"]}: {len(overview_tracks)}'
@@ -580,7 +635,6 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
     ax.set_aspect('equal', adjustable='box')
-    ax.set_title(f"{labels['title']} - {'全时段轨迹总览' if labels['frame'] == '帧号' else 'Full Trajectory Overview'}", fontsize=14, color=VIZ_STYLE['title_color'], pad=12, fontweight='semibold')
     ax.set_xlabel(labels['xlabel'], fontsize=10, color=VIZ_STYLE['tick_color'])
     ax.set_ylabel(labels['ylabel'], fontsize=10, color=VIZ_STYLE['tick_color'])
 
