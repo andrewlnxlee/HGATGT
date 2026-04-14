@@ -35,10 +35,10 @@ def viz_one_sample():
             pts = meas[mask]
             
             # 使用 alpha 透明度模拟时间流逝（越新的越深）
-            alpha = 0.1 + 0.9 * (t / len(data))
+            alpha = 0.4 + 0.6 * (t / len(data))
             
             plt.scatter(pts[:, 0], pts[:, 1], c=colors.get(uid, 'black'), 
-                        s=10, alpha=alpha, edgecolors='none')
+                        s=15, alpha=alpha, edgecolors='none')
 
     plt.title("Accumulated Trajectory: Natural Merge/Split")
     plt.xlabel("X (m)")
