@@ -70,12 +70,10 @@ VIZ_STYLE = {
     'merge_arrow_outline_width': 5.0,
     'merge_detect_thresh': 72.0,
     'merge_arrow_color': '#D84B3A',
-    'merge_highlight_width': 4.0,
-    'merge_highlight_alpha': 0.96,
-    'merge_highlight_factor': 0.72,
-    'merge_source_tail_points': 8,
-    'merge_child_head_points': 10,
-    'merge_snap_thresh': 20.0,
+    'continuous_width': 3.2,
+    'continuous_alpha': 0.92,
+    'continuous_point_size': 16,
+    'continuous_lighten_factor': 0.72,
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -194,6 +192,22 @@ def compute_display_tracks(gnn_processor, lineage_meta, bridge_events):
             display_tracks[child_id].setdefault('bridges', []).append(event)
 
     return display_tracks
+
+
+def compute_raw_tracks(gnn_processor, lineage_meta):
+    raw_tracks = {}
+    for track_id, trk in gnn_processor.tracks.items():
+        root_id = lineage_meta.get(track_id, {}).get('root_id', track_id)
+        generation = lineage_meta.get(track_id, {}).get('generation', 0)
+        base_color = get_track_color(root_id)
+        color_factor = 1.0 + min(generation, 3) * 0.08
+        raw_tracks[track_id] = {
+            'trace': np.asarray(trk.get('trace', []), dtype=float),
+            'color': adjust_color(base_color, color_factor),
+            'root_id': root_id,
+            'age': int(trk.get('age', 0)),
+        }
+    return raw_tracks
 
 
 def update_recent_history(recent_history, display_tracks, frame_idx):
@@ -464,20 +478,11 @@ def draw_bridge(ax, bridge, color, frame_idx):
     )
 
 
-def collect_overview_tracks(viz_frames):
+def collect_overview_tracks(viz_frames, field_name):
     overview_tracks = {}
-    overview_bridges = {}
-    persistent_merges = {}
 
-    prev_centers = {}
-    prev_ids = set()
-    prev_frame_idx = None
-
-    for frame_idx, data in enumerate(viz_frames):
-        current_centers = {int(tid): np.asarray(center, dtype=float) for tid, center in data.get('centers', {}).items()}
-        current_ids = set(current_centers.keys())
-
-        for track_id, track_info in data.get('display_tracks', {}).items():
+    for data in viz_frames:
+        for track_id, track_info in data.get(field_name, {}).items():
             trace = np.asarray(track_info.get('trace', []), dtype=float)
             if not trace.size:
                 continue
@@ -486,62 +491,16 @@ def collect_overview_tracks(viz_frames):
                 overview_tracks[track_id] = {
                     'trace': trace.copy(),
                     'color': track_info['color'],
-                    'root_id': track_info['root_id'],
+                    'root_id': track_info.get('root_id', track_id),
                 }
 
-            for bridge in track_info.get('bridges', []):
-                key = (
-                    bridge['start_frame'],
-                    tuple(np.round(bridge['start'], 4)),
-                    tuple(np.round(bridge['end'], 4)),
-                    bridge['type'],
-                )
-                overview_bridges[key] = {
-                    'start': np.asarray(bridge['start'], dtype=float),
-                    'end': np.asarray(bridge['end'], dtype=float),
-                    'type': bridge['type'],
-                    'child_id': track_id,
-                    'start_frame': bridge['start_frame'],
-                }
-
-        if prev_frame_idx is not None:
-            vanished_ids = prev_ids - current_ids
-            survived_ids = prev_ids & current_ids
-            for vanished_id in vanished_ids:
-                vanish_center = prev_centers[vanished_id]
-                candidates = []
-                for survive_id in survived_ids:
-                    survive_center = current_centers[survive_id]
-                    distance = float(np.linalg.norm(survive_center - vanish_center))
-                    if distance <= VIZ_STYLE['merge_detect_thresh']:
-                        candidates.append((distance, survive_id, survive_center))
-                if candidates:
-                    candidates.sort(key=lambda item: item[0])
-                    _, child_id, child_center = candidates[0]
-                    key = (prev_frame_idx, vanished_id, child_id)
-                    persistent_merges[key] = {
-                        'start': vanish_center.copy(),
-                        'end': child_center.copy(),
-                        'type': 'merge_persistent',
-                        'child_id': child_id,
-                        'start_frame': prev_frame_idx,
-                        'source_id': vanished_id,
-                    }
-
-        prev_centers = current_centers
-        prev_ids = current_ids
-        prev_frame_idx = frame_idx
-
-    overview_bridges.update({
-        ('persistent', item['start_frame'], item['source_id'], item['child_id']): item
-        for item in persistent_merges.values()
-    })
-    return overview_tracks, list(overview_bridges.values())
+    return overview_tracks
 
 
 def save_track_overview(viz_frames, xlim, ylim, labels):
-    overview_tracks, overview_bridges = collect_overview_tracks(viz_frames)
-    if not overview_tracks:
+    raw_overview_tracks = collect_overview_tracks(viz_frames, 'raw_tracks')
+    continuous_overview_tracks = collect_overview_tracks(viz_frames, 'display_tracks')
+    if not raw_overview_tracks and not continuous_overview_tracks:
         return None
 
     fig, ax = plt.subplots(figsize=VIZ_STYLE['figsize'], dpi=VIZ_STYLE['dpi'])
@@ -549,130 +508,59 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     fig.subplots_adjust(left=0.11, right=0.97, bottom=0.10, top=0.97)
     style_axes(ax)
 
-    merge_endpoints = {}
-    highlighted_segments = {}
-    source_segments = {}
-    for bridge in overview_bridges:
-        if bridge['type'] not in {'merge', 'merge_persistent'}:
-            continue
-        child_track = overview_tracks.get(bridge['child_id'])
-        if child_track is None:
-            continue
-        trace = child_track['trace']
-        distances = np.linalg.norm(trace - np.asarray(bridge['end'], dtype=float), axis=1)
-        merge_idx = int(np.argmin(distances))
-        key = tuple(np.round(bridge['end'], 4))
-        merge_endpoints.setdefault(key, {
-            'point': np.asarray(bridge['end'], dtype=float),
-            'child_ids': set(),
-        })
-        merge_endpoints[key]['child_ids'].add(bridge['child_id'])
-        current_idx = highlighted_segments.get(bridge['child_id'])
-        if current_idx is None or merge_idx < current_idx:
-            highlighted_segments[bridge['child_id']] = merge_idx
-
-        start_point = np.asarray(bridge['start'], dtype=float)
-        best_source_id = None
-        best_source_idx = None
-        best_source_dist = None
-        for source_id, source_track in overview_tracks.items():
-            source_trace = source_track['trace']
-            source_distances = np.linalg.norm(source_trace - start_point, axis=1)
-            source_idx = int(np.argmin(source_distances))
-            source_dist = float(source_distances[source_idx])
-            if source_dist <= VIZ_STYLE['merge_snap_thresh']:
-                if best_source_dist is None or source_dist < best_source_dist:
-                    best_source_id = source_id
-                    best_source_idx = source_idx
-                    best_source_dist = source_dist
-        if best_source_id is not None:
-            existing = source_segments.get(best_source_id)
-            if existing is None or best_source_idx > existing:
-                source_segments[best_source_id] = best_source_idx
-
-    for track_id in sorted(overview_tracks):
-        track_info = overview_tracks[track_id]
+    for track_id in sorted(raw_overview_tracks):
+        track_info = raw_overview_tracks[track_id]
         trace = track_info['trace']
         color = track_info['color']
         ax.plot(
             trace[:, 0], trace[:, 1],
-            color=mcolors.to_rgba(color, 0.34),
-            linewidth=1.6,
+            color=mcolors.to_rgba(color, 0.26),
+            linewidth=1.25,
             solid_capstyle='round',
-            zorder=2,
+            zorder=1,
         )
         ax.scatter(
             trace[:, 0], trace[:, 1],
-            color=mcolors.to_rgba(color, 0.52),
-            s=10,
+            color=mcolors.to_rgba(color, 0.34),
+            s=9,
             edgecolors='none',
-            zorder=3,
+            zorder=2,
         )
 
-        if track_id in source_segments:
-            source_end_idx = source_segments[track_id]
-            source_start_idx = max(0, source_end_idx - VIZ_STYLE['merge_source_tail_points'] + 1)
-            source_trace = trace[source_start_idx:source_end_idx + 1]
-            if len(source_trace) >= 2:
-                ax.plot(
-                    source_trace[:, 0], source_trace[:, 1],
-                    color=mcolors.to_rgba('white', 0.98),
-                    linewidth=VIZ_STYLE['merge_highlight_width'] + 1.6,
-                    solid_capstyle='round',
-                    zorder=4,
-                )
-                ax.plot(
-                    source_trace[:, 0], source_trace[:, 1],
-                    color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.88),
-                    linewidth=VIZ_STYLE['merge_highlight_width'] - 0.3,
-                    solid_capstyle='round',
-                    zorder=5,
-                )
-                ax.scatter(
-                    source_trace[:, 0], source_trace[:, 1],
-                    color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.92),
-                    s=16,
-                    edgecolors='white',
-                    linewidths=0.25,
-                    zorder=6,
-                )
-
-        if track_id in highlighted_segments and len(trace) - highlighted_segments[track_id] >= 2:
-            child_start_idx = highlighted_segments[track_id]
-            child_end_idx = min(len(trace), child_start_idx + VIZ_STYLE['merge_child_head_points'])
-            merge_trace = trace[child_start_idx:child_end_idx]
-            highlight_color = adjust_color(color, VIZ_STYLE['merge_highlight_factor'])
-            ax.plot(
-                merge_trace[:, 0], merge_trace[:, 1],
-                color=mcolors.to_rgba('white', 0.98),
-                linewidth=VIZ_STYLE['merge_highlight_width'] + 1.8,
-                solid_capstyle='round',
-                zorder=4,
-            )
-            ax.plot(
-                merge_trace[:, 0], merge_trace[:, 1],
-                color=mcolors.to_rgba(highlight_color, VIZ_STYLE['merge_highlight_alpha']),
-                linewidth=VIZ_STYLE['merge_highlight_width'],
-                solid_capstyle='round',
-                zorder=5,
-            )
-            ax.scatter(
-                merge_trace[:, 0], merge_trace[:, 1],
-                color=mcolors.to_rgba(highlight_color, 0.88),
-                s=18,
-                edgecolors='white',
-                linewidths=0.3,
-                zorder=6,
-            )
-
+    for track_id in sorted(continuous_overview_tracks):
+        track_info = continuous_overview_tracks[track_id]
+        trace = track_info['trace']
+        color = adjust_color(track_info['color'], VIZ_STYLE['continuous_lighten_factor'])
+        ax.plot(
+            trace[:, 0], trace[:, 1],
+            color=mcolors.to_rgba('white', 0.98),
+            linewidth=VIZ_STYLE['continuous_width'] + 1.6,
+            solid_capstyle='round',
+            zorder=3,
+        )
+        ax.plot(
+            trace[:, 0], trace[:, 1],
+            color=mcolors.to_rgba(color, VIZ_STYLE['continuous_alpha']),
+            linewidth=VIZ_STYLE['continuous_width'],
+            solid_capstyle='round',
+            zorder=4,
+        )
+        ax.scatter(
+            trace[:, 0], trace[:, 1],
+            color=mcolors.to_rgba(color, 0.88),
+            s=VIZ_STYLE['continuous_point_size'],
+            edgecolors='white',
+            linewidths=0.25,
+            zorder=5,
+        )
         ax.scatter(
             trace[0, 0], trace[0, 1],
-            color=mcolors.to_rgba(color, 0.78),
+            color=mcolors.to_rgba(color, 0.82),
             s=28,
             marker='o',
             edgecolors='white',
             linewidths=0.7,
-            zorder=7,
+            zorder=6,
         )
         ax.scatter(
             trace[-1, 0], trace[-1, 1],
@@ -681,7 +569,7 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             marker='X',
             edgecolors='white',
             linewidths=0.7,
-            zorder=8,
+            zorder=7,
         )
         ax.annotate(
             f'G{int(track_id)}',
@@ -699,51 +587,12 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
                 ec=mcolors.to_rgba(color, 0.55),
                 lw=0.8,
             ),
-            zorder=9,
-        )
-
-    for merge_info in merge_endpoints.values():
-        if len(merge_info['child_ids']) < 1:
-            continue
-        point = merge_info['point']
-        ax.scatter(
-            point[0], point[1],
-            s=VIZ_STYLE['merge_marker_outer_size'],
-            color='white',
-            edgecolors='none',
-            alpha=0.94,
-            zorder=9,
-        )
-        ax.scatter(
-            point[0], point[1],
-            s=VIZ_STYLE['merge_marker_inner_size'],
-            color=VIZ_STYLE['merge_arrow_color'],
-            marker='P',
-            edgecolors='white',
-            linewidths=0.8,
-            zorder=10,
-        )
-        ax.text(
-            point[0] + 10,
-            point[1] + 8,
-            'merge',
-            color=VIZ_STYLE['merge_arrow_color'],
-            fontsize=VIZ_STYLE['label_fontsize'],
-            fontweight='semibold',
-            ha='left',
-            va='bottom',
-            bbox=dict(
-                boxstyle='round,pad=0.2',
-                fc=mcolors.to_rgba('white', 0.9),
-                ec=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.4),
-                lw=0.8,
-            ),
-            zorder=10,
+            zorder=8,
         )
 
     info_text = (
         f'{labels["frame"]}: 00-{len(viz_frames) - 1:02d}\n'
-        f'{labels["active_groups"]}: {len(overview_tracks)}'
+        f'{labels["active_groups"]}: {len(continuous_overview_tracks) or len(raw_overview_tracks)}'
     )
     ax.text(
         0.02, 0.98, info_text,
@@ -889,11 +738,13 @@ def run_inference_and_viz():
                 'centers': {},
                 'acc': 0.0,
                 'display_tracks': {},
+                'raw_tracks': {},
             }
 
             if num_nodes == 0:
                 gnn_processor.update(np.empty((0, 2)), None)
                 frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
+                frame_data['raw_tracks'] = compute_raw_tracks(gnn_processor, lineage_meta)
                 update_recent_history(recent_history, frame_data['display_tracks'], t)
                 prev_track_ids = set(frame_data['display_tracks'].keys())
                 viz_frames.append(frame_data)
@@ -943,6 +794,7 @@ def run_inference_and_viz():
             lineage_events = create_lineage_events(new_track_ids, prev_track_ids, frame_data['display_tracks'], recent_history, t)
             apply_lineage_events(lineage_meta, bridge_events, lineage_events)
             frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
+            frame_data['raw_tracks'] = compute_raw_tracks(gnn_processor, lineage_meta)
 
             seen_track_ids.update(current_track_ids)
             update_recent_history(recent_history, frame_data['display_tracks'], t)
