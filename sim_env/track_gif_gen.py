@@ -53,7 +53,14 @@ VIZ_STYLE = {
     'trail_alpha_max': 0.52,
     'trail_width_min': 0.9,
     'trail_width_max': 2.6,
-    'tail_length': 24,
+    'tail_length': None,
+    'ghost_age': 3,
+    'ghost_alpha_scale': 0.62,
+    'inherit_dist_thresh': 26.0,
+    'inherit_history_frames': 4,
+    'bridge_frames': 6,
+    'bridge_alpha': 0.52,
+    'bridge_width': 1.5,
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -88,6 +95,209 @@ def get_track_color(track_id):
     return COLOR_PALETTE[(int(track_id) - 1) % len(COLOR_PALETTE)]
 
 
+def adjust_color(color, factor):
+    rgb = np.array(mcolors.to_rgb(color))
+    if factor >= 1.0:
+        return tuple(np.clip(rgb + (1.0 - rgb) * (factor - 1.0), 0.0, 1.0))
+    return tuple(np.clip(rgb * factor, 0.0, 1.0))
+
+
+def build_display_trace(base_trace, inherited_prefix):
+    trace_parts = []
+    if len(inherited_prefix):
+        trace_parts.append(np.asarray(inherited_prefix, dtype=float))
+    if len(base_trace):
+        base_arr = np.asarray(base_trace, dtype=float)
+        if trace_parts and np.allclose(trace_parts[-1][-1], base_arr[0]):
+            base_arr = base_arr[1:]
+        if len(base_arr):
+            trace_parts.append(base_arr)
+
+    if not trace_parts:
+        return np.empty((0, 2), dtype=float)
+
+    return np.vstack(trace_parts)
+
+
+def compute_display_tracks(gnn_processor, lineage_meta, bridge_events):
+    display_tracks = {}
+    for track_id, trk in gnn_processor.tracks.items():
+        root_id = lineage_meta.get(track_id, {}).get('root_id', track_id)
+        generation = lineage_meta.get(track_id, {}).get('generation', 0)
+        base_color = get_track_color(root_id)
+        color_factor = 1.0 + min(generation, 3) * 0.08
+        trace = build_display_trace(
+            trk.get('trace', []),
+            lineage_meta.get(track_id, {}).get('inherited_prefix', np.empty((0, 2), dtype=float)),
+        )
+        display_tracks[track_id] = {
+            'root_id': root_id,
+            'generation': generation,
+            'parents': tuple(lineage_meta.get(track_id, {}).get('parents', ())),
+            'trace': trace,
+            'age': int(trk.get('age', 0)),
+            'is_observed': int(trk.get('age', 0)) == 0,
+            'center': np.asarray(trk.get('last_meas', trk['x'][:2]), dtype=float),
+            'pred_center': np.asarray(trk['x'][:2], dtype=float),
+            'color': adjust_color(base_color, color_factor),
+            'shape': np.asarray(trk.get('shape', np.array([3.0, 3.0])), dtype=float),
+        }
+
+    for event in bridge_events:
+        child_id = event['child_id']
+        if child_id in display_tracks:
+            display_tracks[child_id].setdefault('bridges', []).append(event)
+
+    return display_tracks
+
+
+def update_recent_history(recent_history, display_tracks, frame_idx):
+    for track_id, info in display_tracks.items():
+        recent_history.setdefault(track_id, []).append({
+            'frame_idx': frame_idx,
+            'center': np.asarray(info['center'], dtype=float),
+            'trace': np.asarray(info['trace'], dtype=float),
+            'root_id': info['root_id'],
+            'generation': info['generation'],
+        })
+        recent_history[track_id] = recent_history[track_id][-VIZ_STYLE['inherit_history_frames']:]
+
+
+def create_lineage_events(new_track_ids, prev_track_ids, display_tracks, recent_history, frame_idx):
+    events = []
+    if not new_track_ids or not prev_track_ids:
+        return events
+
+    child_candidates = []
+    for child_id in new_track_ids:
+        child_info = display_tracks.get(child_id)
+        if child_info is None:
+            continue
+        child_center = np.asarray(child_info['center'], dtype=float)
+        candidates = []
+        for parent_id in prev_track_ids:
+            history = recent_history.get(parent_id)
+            if not history:
+                continue
+            parent_snapshot = history[-1]
+            parent_center = np.asarray(parent_snapshot['center'], dtype=float)
+            distance = float(np.linalg.norm(child_center - parent_center))
+            if distance <= VIZ_STYLE['inherit_dist_thresh']:
+                candidates.append((distance, parent_id, parent_snapshot))
+        if candidates:
+            child_candidates.append((child_id, sorted(candidates, key=lambda item: item[0])))
+
+    if not child_candidates:
+        return events
+
+    parent_children = {}
+    for child_id, candidates in child_candidates:
+        _, best_parent, best_snapshot = candidates[0]
+        parent_children.setdefault(best_parent, []).append((child_id, best_snapshot))
+
+    split_parents = {pid for pid, childs in parent_children.items() if len(childs) > 1}
+
+    child_all_candidates = {child_id: candidates for child_id, candidates in child_candidates}
+    merge_children = set()
+    for child_id, candidates in child_all_candidates.items():
+        close_candidates = [item for item in candidates if item[0] <= VIZ_STYLE['inherit_dist_thresh']]
+        if len(close_candidates) > 1:
+            merge_children.add(child_id)
+
+    handled_pairs = set()
+    for child_id in sorted(merge_children):
+        candidates = child_all_candidates[child_id]
+        parents = [item[1] for item in candidates]
+        parent_snapshots = {item[1]: item[2] for item in candidates}
+        primary_parent = candidates[0][1]
+        primary_snapshot = parent_snapshots[primary_parent]
+        events.append({
+            'type': 'merge',
+            'child_id': child_id,
+            'parents': parents,
+            'primary_parent': primary_parent,
+            'root_id': primary_snapshot['root_id'],
+            'generation': primary_snapshot['generation'] + 1,
+            'prefix': np.asarray(primary_snapshot['trace'], dtype=float),
+            'bridges': [
+                {
+                    'start': np.asarray(parent_snapshots[parent_id]['center'], dtype=float),
+                    'end': np.asarray(display_tracks[child_id]['center'], dtype=float),
+                    'start_frame': frame_idx,
+                    'type': 'merge',
+                }
+                for parent_id in parents
+            ],
+        })
+        handled_pairs.add((primary_parent, child_id))
+
+    for parent_id in sorted(split_parents):
+        children = parent_children[parent_id]
+        parent_snapshot = children[0][1]
+        for child_id, _ in children:
+            if child_id in merge_children:
+                continue
+            events.append({
+                'type': 'split',
+                'child_id': child_id,
+                'parents': [parent_id],
+                'primary_parent': parent_id,
+                'root_id': parent_snapshot['root_id'],
+                'generation': parent_snapshot['generation'] + 1,
+                'prefix': np.asarray(parent_snapshot['trace'], dtype=float),
+                'bridges': [{
+                    'start': np.asarray(parent_snapshot['center'], dtype=float),
+                    'end': np.asarray(display_tracks[child_id]['center'], dtype=float),
+                    'start_frame': frame_idx,
+                    'type': 'split',
+                }],
+            })
+            handled_pairs.add((parent_id, child_id))
+
+    for child_id, candidates in child_candidates:
+        if child_id in merge_children:
+            continue
+        best_distance, best_parent, best_snapshot = candidates[0]
+        if (best_parent, child_id) in handled_pairs:
+            continue
+        events.append({
+            'type': 'inherit',
+            'child_id': child_id,
+            'parents': [best_parent],
+            'primary_parent': best_parent,
+            'root_id': best_snapshot['root_id'],
+            'generation': best_snapshot['generation'] + 1,
+            'prefix': np.asarray(best_snapshot['trace'], dtype=float),
+            'bridges': [{
+                'start': np.asarray(best_snapshot['center'], dtype=float),
+                'end': np.asarray(display_tracks[child_id]['center'], dtype=float),
+                'start_frame': frame_idx,
+                'type': 'inherit',
+            }],
+        })
+
+    deduped = {}
+    for event in events:
+        child_id = event['child_id']
+        priority = {'merge': 0, 'split': 1, 'inherit': 2}[event['type']]
+        existing = deduped.get(child_id)
+        if existing is None or priority < existing[0]:
+            deduped[child_id] = (priority, event)
+    return [item[1] for item in deduped.values()]
+
+
+def apply_lineage_events(lineage_meta, bridge_events, events):
+    for event in events:
+        child_id = event['child_id']
+        lineage_meta[child_id] = {
+            'root_id': event['root_id'],
+            'parents': tuple(event['parents']),
+            'generation': event['generation'],
+            'inherited_prefix': np.asarray(event['prefix'], dtype=float),
+        }
+        bridge_events.extend(event['bridges'])
+
+
 def compute_scene_limits(viz_frames):
     collected = []
     for data in viz_frames:
@@ -97,10 +307,12 @@ def compute_scene_limits(viz_frames):
             collected.append(data['plot_pos'])
         if data['centers']:
             collected.append(np.vstack(list(data['centers'].values())))
-        for trace in data['trace'].values():
-            trace = np.asarray(trace)
+        for track_info in data.get('display_tracks', {}).values():
+            trace = np.asarray(track_info.get('trace', []))
             if trace.size:
                 collected.append(trace)
+            for bridge in track_info.get('bridges', []):
+                collected.append(np.vstack([bridge['start'], bridge['end']]))
 
     if not collected:
         return (-1.0, 1.0), (-1.0, 1.0)
@@ -167,12 +379,15 @@ def draw_group_region(ax, points, color):
         )
 
 
-def draw_fading_trail(ax, trace, color):
+def draw_fading_trail(ax, trace, color, alpha_scale=1.0):
     trace = np.asarray(trace)
     if len(trace) < 2:
         return
 
-    trace = trace[-VIZ_STYLE['tail_length']:]
+    tail_length = VIZ_STYLE['tail_length']
+    if tail_length is not None:
+        trace = trace[-tail_length:]
+
     num_segments = len(trace) - 1
     for idx in range(num_segments):
         frac = (idx + 1) / num_segments
@@ -180,11 +395,28 @@ def draw_fading_trail(ax, trace, color):
         linewidth = VIZ_STYLE['trail_width_min'] + frac * (VIZ_STYLE['trail_width_max'] - VIZ_STYLE['trail_width_min'])
         ax.plot(
             trace[idx:idx + 2, 0], trace[idx:idx + 2, 1],
-            color=mcolors.to_rgba(color, alpha),
+            color=mcolors.to_rgba(color, min(alpha * alpha_scale, 0.95)),
             linewidth=linewidth,
             solid_capstyle='round',
             zorder=3,
         )
+
+
+def draw_bridge(ax, bridge, color, frame_idx):
+    age = frame_idx - bridge['start_frame']
+    if age < 0 or age >= VIZ_STYLE['bridge_frames']:
+        return
+
+    fade = 1.0 - age / max(VIZ_STYLE['bridge_frames'], 1)
+    ax.plot(
+        [bridge['start'][0], bridge['end'][0]],
+        [bridge['start'][1], bridge['end'][1]],
+        color=mcolors.to_rgba(color, VIZ_STYLE['bridge_alpha'] * fade),
+        linewidth=VIZ_STYLE['bridge_width'],
+        linestyle='--',
+        solid_capstyle='round',
+        zorder=2,
+    )
 
 
 def build_gnn_detections(raw_pos, corrected_pos):
@@ -284,6 +516,11 @@ def run_inference_and_viz():
     episode_graphs = test_set.get(NUM)
 
     gnn_processor = GNNPostProcessor()
+    lineage_meta = {}
+    bridge_events = []
+    recent_history = {}
+    prev_track_ids = set()
+    seen_track_ids = set()
 
     viz_frames = []
     print(f'Starting inference on {len(episode_graphs)} frames...')
@@ -300,13 +537,16 @@ def run_inference_and_viz():
                 'track_ids': np.full(num_nodes, -1, dtype=int),
                 'centers': {},
                 'acc': 0.0,
-                'trace': {},
+                'display_tracks': {},
             }
 
             if num_nodes == 0:
                 gnn_processor.update(np.empty((0, 2)), None)
+                frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
+                update_recent_history(recent_history, frame_data['display_tracks'], t)
+                prev_track_ids = set(frame_data['display_tracks'].keys())
                 viz_frames.append(frame_data)
-                print(f'Frame {t:02d} | Edge Acc: 0.00% | Active Tracks: 0')
+                print(f'Frame {t:02d} | Active Tracks: 0')
                 continue
 
             model_out = model(graph_dev)
@@ -327,7 +567,7 @@ def run_inference_and_viz():
             pred_centers = np.array(pred_centers).reshape(-1, 2)
             pred_track_ids = np.array(pred_track_ids).reshape(-1)
 
-            point_track_ids, centers, matched_track_ids = assign_tracks_to_points(
+            point_track_ids, centers, _ = assign_tracks_to_points(
                 pred_centers,
                 pred_track_ids,
                 det_centers,
@@ -337,12 +577,28 @@ def run_inference_and_viz():
 
             frame_data['track_ids'] = point_track_ids
             frame_data['centers'] = centers
-            for track_id in matched_track_ids:
-                if track_id in gnn_processor.tracks:
-                    frame_data['trace'][track_id] = np.array(gnn_processor.tracks[track_id]['trace'])
+
+            current_track_ids = set(gnn_processor.tracks.keys())
+            for track_id in current_track_ids:
+                lineage_meta.setdefault(track_id, {
+                    'root_id': track_id,
+                    'parents': tuple(),
+                    'generation': 0,
+                    'inherited_prefix': np.empty((0, 2), dtype=float),
+                })
+
+            frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
+            new_track_ids = sorted(current_track_ids - seen_track_ids)
+            lineage_events = create_lineage_events(new_track_ids, prev_track_ids, frame_data['display_tracks'], recent_history, t)
+            apply_lineage_events(lineage_meta, bridge_events, lineage_events)
+            frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
+
+            seen_track_ids.update(current_track_ids)
+            update_recent_history(recent_history, frame_data['display_tracks'], t)
+            prev_track_ids = set(frame_data['display_tracks'].keys())
 
             viz_frames.append(frame_data)
-            print(f"Frame {t:02d} | Edge Acc: {frame_data['acc'] * 100:.2f}% | Active Tracks: {len(frame_data['centers'])}")
+            print(f"Frame {t:02d} | Active Tracks: {len(frame_data['centers'])}")
 
     if not viz_frames:
         print('No frames to visualize.')
@@ -363,6 +619,7 @@ def run_inference_and_viz():
         raw_pos = data['raw_pos']
         plot_pos = data['plot_pos']
         track_ids = data['track_ids']
+        display_tracks = data.get('display_tracks', {})
 
         clutter_mask = track_ids == -1
         if np.any(clutter_mask):
@@ -375,17 +632,25 @@ def run_inference_and_viz():
                 zorder=0,
             )
 
+        for uid in sorted(display_tracks):
+            track_info = display_tracks[uid]
+            if track_info['age'] > VIZ_STYLE['ghost_age']:
+                continue
+            color = track_info['color']
+            alpha_scale = 1.0 if track_info['age'] == 0 else VIZ_STYLE['ghost_alpha_scale']
+            draw_fading_trail(ax, track_info['trace'], color, alpha_scale=alpha_scale)
+            for bridge in track_info.get('bridges', []):
+                draw_bridge(ax, bridge, color, frame_idx)
+
         unique_ids = [uid for uid in np.unique(track_ids) if uid != -1]
         for uid in unique_ids:
             mask = track_ids == uid
-            color = get_track_color(uid)
+            track_info = display_tracks.get(uid, {})
+            color = track_info.get('color', get_track_color(uid))
             raw_group_points = raw_pos[mask]
             group_points = plot_pos[mask]
 
             draw_group_region(ax, group_points, color)
-
-            if uid in data['trace']:
-                draw_fading_trail(ax, data['trace'][uid], color)
 
             if len(raw_group_points):
                 for raw_pt, fused_pt in zip(raw_group_points, group_points):
@@ -456,9 +721,8 @@ def run_inference_and_viz():
                 )
 
         info_text = (
-            f'Frame {frame_idx:02d}\n'
-            f'Active groups  {len(data["centers"])}\n'
-            f'Edge acc  {data["acc"] * 100:5.1f}%'
+            f'帧号：{frame_idx:02d}\n'
+            f'活跃群组：{len(data["centers"])}'
         )
         ax.text(
             0.02, 0.98, info_text,
@@ -474,9 +738,9 @@ def run_inference_and_viz():
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
         ax.set_aspect('equal', adjustable='box')
-        ax.set_title('H-GAT-GT Group Tracking', fontsize=14, color=VIZ_STYLE['title_color'], pad=12, fontweight='semibold')
-        ax.set_xlabel('X (m)', fontsize=10, color=VIZ_STYLE['tick_color'])
-        ax.set_ylabel('Y (m)', fontsize=10, color=VIZ_STYLE['tick_color'])
+        ax.set_title('H-GAT-GT 群组轨迹跟踪', fontsize=14, color=VIZ_STYLE['title_color'], pad=12, fontweight='semibold')
+        ax.set_xlabel('X（米）', fontsize=10, color=VIZ_STYLE['tick_color'])
+        ax.set_ylabel('Y（米）', fontsize=10, color=VIZ_STYLE['tick_color'])
 
     os.makedirs(config.OUTPUT_GIF_DIR, exist_ok=True)
     path2 = os.path.join(config.OUTPUT_GIF_DIR, f'sim_data_{NUM}_track_result_paper.gif')
