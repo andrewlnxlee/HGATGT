@@ -745,6 +745,42 @@ def save_track_overview(viz_frames, xlim, ylim, labels, relation_events):
         )
 
     for relation in relation_events:
+        rel_type = relation.get('type')
+        if rel_type in {'merge', 'split'}:
+            parents = relation.get('parents', [])
+            children = relation.get('children', [])
+            
+            if rel_type == 'merge' and children:
+                cid = children[0]
+                if cid in continuous_overview_tracks:
+                    c_pt = continuous_overview_tracks[cid]['trace'][0]
+                    for pid in parents:
+                        if pid in continuous_overview_tracks:
+                            p_pt = continuous_overview_tracks[pid]['trace'][-1]
+                            p_color = continuous_overview_tracks[pid]['color']
+                            ax.plot(
+                                [p_pt[0], c_pt[0]], [p_pt[1], c_pt[1]],
+                                color=mcolors.to_rgba(p_color, VIZ_STYLE['merge_link_alpha']),
+                                linestyle='--',
+                                linewidth=VIZ_STYLE['merge_link_width'],
+                                zorder=4.5
+                            )
+            elif rel_type == 'split' and parents:
+                pid = parents[0]
+                if pid in continuous_overview_tracks:
+                    p_pt = continuous_overview_tracks[pid]['trace'][-1]
+                    for cid in children:
+                        if cid in continuous_overview_tracks:
+                            c_pt = continuous_overview_tracks[cid]['trace'][0]
+                            c_color = continuous_overview_tracks[cid]['color']
+                            ax.plot(
+                                [p_pt[0], c_pt[0]], [p_pt[1], c_pt[1]],
+                                color=mcolors.to_rgba(c_color, VIZ_STYLE['merge_link_alpha']),
+                                linestyle='--',
+                                linewidth=VIZ_STYLE['merge_link_width'],
+                                zorder=4.5
+                            )
+
         draw_relation_event(ax, relation, overview=True)
 
     info_text = (
