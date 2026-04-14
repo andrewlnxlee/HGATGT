@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.colors as mcolors
+from matplotlib import font_manager
 from matplotlib.patches import Polygon
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import ConvexHull, QhullError
@@ -73,6 +74,36 @@ COLOR_PALETTE = [
     '#738B3A', '#3F7CB1', '#B86272', '#796AB2', '#C6A02B',
     '#2F8F9D', '#A86A3B'
 ]
+
+CJK_FONT_CANDIDATES = [
+    'Noto Sans CJK SC', 'Noto Sans CJK JP', 'Noto Sans SC', 'Source Han Sans SC',
+    'Source Han Sans CN', 'WenQuanYi Zen Hei', 'SimHei', 'Microsoft YaHei',
+    'PingFang SC', 'Heiti SC', 'Arial Unicode MS'
+]
+
+
+def configure_text_labels():
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    for font_name in CJK_FONT_CANDIDATES:
+        if font_name in available_fonts:
+            plt.rcParams['font.sans-serif'] = [font_name] + list(plt.rcParams.get('font.sans-serif', []))
+            plt.rcParams['axes.unicode_minus'] = False
+            return {
+                'title': 'H-GAT-GT 群组轨迹跟踪',
+                'xlabel': 'X (m)',
+                'ylabel': 'Y (m)',
+                'frame': '帧号',
+                'active_groups': '活跃群组',
+            }
+
+    plt.rcParams['axes.unicode_minus'] = False
+    return {
+        'title': 'H-GAT-GT Group Tracking',
+        'xlabel': 'X (m)',
+        'ylabel': 'Y (m)',
+        'frame': 'Frame',
+        'active_groups': 'Active groups',
+    }
 
 
 def unpack_group_offsets(model_out):
@@ -496,6 +527,7 @@ def compute_edge_accuracy(edge_scores, graph):
 # 推理主流程（与 evaluate.py 主线对齐）
 # ==========================================
 def run_inference_and_viz():
+    labels = configure_text_labels()
     device = torch.device(config.DEVICE)
 
     model = GNNGroupTracker(
@@ -721,8 +753,8 @@ def run_inference_and_viz():
                 )
 
         info_text = (
-            f'帧号：{frame_idx:02d}\n'
-            f'活跃群组：{len(data["centers"])}'
+            f'{labels["frame"]}: {frame_idx:02d}\n'
+            f'{labels["active_groups"]}: {len(data["centers"])}'
         )
         ax.text(
             0.02, 0.98, info_text,
@@ -738,9 +770,9 @@ def run_inference_and_viz():
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
         ax.set_aspect('equal', adjustable='box')
-        ax.set_title('H-GAT-GT 群组轨迹跟踪', fontsize=14, color=VIZ_STYLE['title_color'], pad=12, fontweight='semibold')
-        ax.set_xlabel('X（米）', fontsize=10, color=VIZ_STYLE['tick_color'])
-        ax.set_ylabel('Y（米）', fontsize=10, color=VIZ_STYLE['tick_color'])
+        ax.set_title(labels['title'], fontsize=14, color=VIZ_STYLE['title_color'], pad=12, fontweight='semibold')
+        ax.set_xlabel(labels['xlabel'], fontsize=10, color=VIZ_STYLE['tick_color'])
+        ax.set_ylabel(labels['ylabel'], fontsize=10, color=VIZ_STYLE['tick_color'])
 
     os.makedirs(config.OUTPUT_GIF_DIR, exist_ok=True)
     path2 = os.path.join(config.OUTPUT_GIF_DIR, f'sim_data_{NUM}_track_result_paper.gif')
