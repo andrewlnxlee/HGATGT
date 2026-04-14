@@ -19,6 +19,7 @@ import config
 from model import GNNGroupTracker
 from dataset import RadarFileDataset
 from trackers.gnn_processor import GNNPostProcessor
+from trackers.gnn_processor_all import build_group_detections
 
 
 NUM = 20  # 选择第几个样本 episode
@@ -74,6 +75,9 @@ VIZ_STYLE = {
     'continuous_alpha': 0.92,
     'continuous_point_size': 16,
     'continuous_lighten_factor': 0.72,
+    'merge_link_alpha': 0.82,
+    'merge_link_width': 2.6,
+    'merge_marker_size': 62,
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -508,6 +512,61 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     fig.subplots_adjust(left=0.11, right=0.97, bottom=0.10, top=0.97)
     style_axes(ax)
 
+    merge_events = []
+    prev_group_ids = set()
+    prev_group_centers = {}
+    prev_group_points = {}
+    prev_frame_idx = None
+    for frame_idx, data in enumerate(viz_frames):
+        plot_pos = np.asarray(data.get('plot_pos', np.empty((0, 2))), dtype=float).reshape(-1, 2)
+        cluster_labels, detected_centers, centroid_to_points, _ = build_group_detections(
+            plot_pos,
+            eps=config.POINT_CLUSTER_EPS,
+            min_samples=config.POINT_CLUSTER_MIN_SAMPLES,
+        )
+        current_group_ids = set(int(gid) for gid in np.unique(data.get('track_ids', np.array([], dtype=int))) if int(gid) > 0)
+        current_group_centers = {int(gid): np.asarray(center, dtype=float) for gid, center in data.get('centers', {}).items()}
+        current_group_points = {}
+        for det_idx, point_indices in centroid_to_points.items():
+            point_indices = np.asarray(point_indices, dtype=int)
+            point_ids = data['track_ids'][point_indices]
+            valid_ids = point_ids[point_ids > 0]
+            if len(valid_ids) == 0:
+                continue
+            uniq_ids, counts = np.unique(valid_ids, return_counts=True)
+            owner_gid = int(uniq_ids[np.argmax(counts)])
+            current_group_points[owner_gid] = np.asarray(point_indices, dtype=int)
+
+        if prev_frame_idx is not None:
+            vanished_group_ids = prev_group_ids - current_group_ids
+            for child_gid, child_points in current_group_points.items():
+                parent_ids = []
+                for parent_gid in sorted(vanished_group_ids):
+                    parent_center = prev_group_centers.get(parent_gid)
+                    child_center = current_group_centers.get(child_gid)
+                    parent_points = prev_group_points.get(parent_gid)
+                    if parent_center is None or child_center is None or parent_points is None:
+                        continue
+                    if len(parent_points) == 0 or len(child_points) == 0:
+                        continue
+                    distance = float(np.linalg.norm(child_center - parent_center))
+                    if distance > GROUP_TO_CLUSTER_THRESH * 2.0:
+                        continue
+                    parent_ids.append(parent_gid)
+                if len(parent_ids) >= 2:
+                    merge_events.append({
+                        'frame_idx': frame_idx,
+                        'parent_ids': tuple(parent_ids),
+                        'child_id': child_gid,
+                        'child_center': np.asarray(current_group_centers[child_gid], dtype=float),
+                        'parent_centers': [np.asarray(prev_group_centers[parent_gid], dtype=float) for parent_gid in parent_ids],
+                    })
+
+        prev_group_ids = current_group_ids
+        prev_group_centers = current_group_centers
+        prev_group_points = current_group_points
+        prev_frame_idx = frame_idx
+
     for track_id in sorted(raw_overview_tracks):
         track_info = raw_overview_tracks[track_id]
         trace = track_info['trace']
@@ -585,6 +644,48 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
                 boxstyle='round,pad=0.25',
                 fc=mcolors.to_rgba('white', 0.88),
                 ec=mcolors.to_rgba(color, 0.55),
+                lw=0.8,
+            ),
+            zorder=8,
+        )
+
+    for event in merge_events:
+        child_id = event['child_id']
+        child_track = continuous_overview_tracks.get(child_id)
+        child_color = adjust_color(child_track['color'], VIZ_STYLE['continuous_lighten_factor']) if child_track else get_track_color(child_id)
+        for parent_center in event['parent_centers']:
+            ax.plot(
+                [parent_center[0], event['child_center'][0]],
+                [parent_center[1], event['child_center'][1]],
+                color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], VIZ_STYLE['merge_link_alpha']),
+                linewidth=VIZ_STYLE['merge_link_width'],
+                linestyle='--',
+                solid_capstyle='round',
+                zorder=6,
+            )
+        ax.scatter(
+            event['child_center'][0], event['child_center'][1],
+            s=VIZ_STYLE['merge_marker_size'],
+            color=VIZ_STYLE['merge_arrow_color'],
+            marker='P',
+            edgecolors='white',
+            linewidths=0.9,
+            zorder=7,
+        )
+        ax.annotate(
+            ' + '.join(f'G{pid}' for pid in event['parent_ids']) + f' -> G{child_id}',
+            xy=(event['child_center'][0], event['child_center'][1]),
+            xytext=(8, 8),
+            textcoords='offset points',
+            color=VIZ_STYLE['merge_arrow_color'],
+            fontsize=VIZ_STYLE['label_fontsize'],
+            fontweight='semibold',
+            ha='left',
+            va='bottom',
+            bbox=dict(
+                boxstyle='round,pad=0.22',
+                fc=mcolors.to_rgba('white', 0.9),
+                ec=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.45),
                 lw=0.8,
             ),
             zorder=8,
