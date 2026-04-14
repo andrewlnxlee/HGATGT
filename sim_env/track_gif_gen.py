@@ -70,6 +70,9 @@ VIZ_STYLE = {
     'merge_arrow_outline_width': 5.0,
     'merge_detect_thresh': 72.0,
     'merge_arrow_color': '#D84B3A',
+    'merge_highlight_width': 4.0,
+    'merge_highlight_alpha': 0.96,
+    'merge_highlight_factor': 0.72,
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -544,6 +547,25 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     style_axes(ax)
 
     merge_endpoints = {}
+    highlighted_segments = {}
+    for bridge in overview_bridges:
+        if bridge['type'] not in {'merge', 'merge_persistent'}:
+            continue
+        child_track = overview_tracks.get(bridge['child_id'])
+        if child_track is None:
+            continue
+        trace = child_track['trace']
+        distances = np.linalg.norm(trace - np.asarray(bridge['end'], dtype=float), axis=1)
+        merge_idx = int(np.argmin(distances))
+        key = tuple(np.round(bridge['end'], 4))
+        merge_endpoints.setdefault(key, {
+            'point': np.asarray(bridge['end'], dtype=float),
+            'child_ids': set(),
+        })
+        merge_endpoints[key]['child_ids'].add(bridge['child_id'])
+        current_idx = highlighted_segments.get(bridge['child_id'])
+        if current_idx is None or merge_idx < current_idx:
+            highlighted_segments[bridge['child_id']] = merge_idx
 
     for track_id in sorted(overview_tracks):
         track_info = overview_tracks[track_id]
@@ -563,6 +585,33 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             edgecolors='none',
             zorder=3,
         )
+
+        if track_id in highlighted_segments and len(trace) - highlighted_segments[track_id] >= 2:
+            merge_trace = trace[highlighted_segments[track_id]:]
+            highlight_color = adjust_color(color, VIZ_STYLE['merge_highlight_factor'])
+            ax.plot(
+                merge_trace[:, 0], merge_trace[:, 1],
+                color=mcolors.to_rgba('white', 0.98),
+                linewidth=VIZ_STYLE['merge_highlight_width'] + 1.8,
+                solid_capstyle='round',
+                zorder=4,
+            )
+            ax.plot(
+                merge_trace[:, 0], merge_trace[:, 1],
+                color=mcolors.to_rgba(highlight_color, VIZ_STYLE['merge_highlight_alpha']),
+                linewidth=VIZ_STYLE['merge_highlight_width'],
+                solid_capstyle='round',
+                zorder=5,
+            )
+            ax.scatter(
+                merge_trace[:, 0], merge_trace[:, 1],
+                color=mcolors.to_rgba(highlight_color, 0.88),
+                s=18,
+                edgecolors='white',
+                linewidths=0.3,
+                zorder=6,
+            )
+
         ax.scatter(
             trace[0, 0], trace[0, 1],
             color=mcolors.to_rgba(color, 0.78),
@@ -570,7 +619,7 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             marker='o',
             edgecolors='white',
             linewidths=0.7,
-            zorder=4,
+            zorder=7,
         )
         ax.scatter(
             trace[-1, 0], trace[-1, 1],
@@ -579,7 +628,7 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             marker='X',
             edgecolors='white',
             linewidths=0.7,
-            zorder=5,
+            zorder=8,
         )
         ax.annotate(
             f'G{int(track_id)}',
@@ -597,82 +646,29 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
                 ec=mcolors.to_rgba(color, 0.55),
                 lw=0.8,
             ),
-            zorder=6,
+            zorder=9,
         )
 
-    for bridge in overview_bridges:
-        child_track = overview_tracks.get(bridge['child_id'])
-        color = child_track['color'] if child_track is not None else get_track_color(bridge['child_id'])
-        is_merge_bridge = bridge['type'] in {'merge', 'merge_persistent'}
-        bridge_alpha = VIZ_STYLE['bridge_alpha'] * (0.95 if is_merge_bridge else 0.80)
-        if is_merge_bridge:
-            ax.annotate(
-                '',
-                xy=(bridge['end'][0], bridge['end'][1]),
-                xytext=(bridge['start'][0], bridge['start'][1]),
-                arrowprops=dict(
-                    arrowstyle='-|>',
-                    color=mcolors.to_rgba('white', 0.96),
-                    lw=VIZ_STYLE['merge_arrow_outline_width'],
-                    shrinkA=0,
-                    shrinkB=0,
-                    mutation_scale=VIZ_STYLE['merge_arrow_head_scale'],
-                ),
-                zorder=6,
-            )
-            ax.annotate(
-                '',
-                xy=(bridge['end'][0], bridge['end'][1]),
-                xytext=(bridge['start'][0], bridge['start'][1]),
-                arrowprops=dict(
-                    arrowstyle='-|>',
-                    color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], bridge_alpha),
-                    lw=VIZ_STYLE['merge_arrow_width'],
-                    shrinkA=0,
-                    shrinkB=0,
-                    mutation_scale=VIZ_STYLE['merge_arrow_head_scale'],
-                ),
-                zorder=7,
-            )
-            key = tuple(np.round(bridge['end'], 4))
-            merge_endpoints.setdefault(key, {
-                'point': np.asarray(bridge['end'], dtype=float),
-                'color': VIZ_STYLE['merge_arrow_color'],
-                'count': 0,
-            })
-            merge_endpoints[key]['count'] += 1
-        else:
-            ax.plot(
-                [bridge['start'][0], bridge['end'][0]],
-                [bridge['start'][1], bridge['end'][1]],
-                color=mcolors.to_rgba(color, bridge_alpha),
-                linewidth=VIZ_STYLE['bridge_width'],
-                linestyle='--',
-                solid_capstyle='round',
-                zorder=6,
-            )
-
     for merge_info in merge_endpoints.values():
-        if merge_info['count'] < 2:
+        if len(merge_info['child_ids']) < 1:
             continue
         point = merge_info['point']
-        color = merge_info['color']
         ax.scatter(
             point[0], point[1],
             s=VIZ_STYLE['merge_marker_outer_size'],
             color='white',
             edgecolors='none',
-            alpha=0.92,
-            zorder=6,
+            alpha=0.94,
+            zorder=9,
         )
         ax.scatter(
             point[0], point[1],
             s=VIZ_STYLE['merge_marker_inner_size'],
-            color=color,
+            color=VIZ_STYLE['merge_arrow_color'],
             marker='P',
             edgecolors='white',
             linewidths=0.8,
-            zorder=7,
+            zorder=10,
         )
 
     info_text = (
