@@ -73,6 +73,9 @@ VIZ_STYLE = {
     'merge_highlight_width': 4.0,
     'merge_highlight_alpha': 0.96,
     'merge_highlight_factor': 0.72,
+    'merge_source_tail_points': 8,
+    'merge_child_head_points': 10,
+    'merge_snap_thresh': 20.0,
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -548,6 +551,7 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
 
     merge_endpoints = {}
     highlighted_segments = {}
+    source_segments = {}
     for bridge in overview_bridges:
         if bridge['type'] not in {'merge', 'merge_persistent'}:
             continue
@@ -566,6 +570,25 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
         current_idx = highlighted_segments.get(bridge['child_id'])
         if current_idx is None or merge_idx < current_idx:
             highlighted_segments[bridge['child_id']] = merge_idx
+
+        start_point = np.asarray(bridge['start'], dtype=float)
+        best_source_id = None
+        best_source_idx = None
+        best_source_dist = None
+        for source_id, source_track in overview_tracks.items():
+            source_trace = source_track['trace']
+            source_distances = np.linalg.norm(source_trace - start_point, axis=1)
+            source_idx = int(np.argmin(source_distances))
+            source_dist = float(source_distances[source_idx])
+            if source_dist <= VIZ_STYLE['merge_snap_thresh']:
+                if best_source_dist is None or source_dist < best_source_dist:
+                    best_source_id = source_id
+                    best_source_idx = source_idx
+                    best_source_dist = source_dist
+        if best_source_id is not None:
+            existing = source_segments.get(best_source_id)
+            if existing is None or best_source_idx > existing:
+                source_segments[best_source_id] = best_source_idx
 
     for track_id in sorted(overview_tracks):
         track_info = overview_tracks[track_id]
@@ -586,8 +609,38 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             zorder=3,
         )
 
+        if track_id in source_segments:
+            source_end_idx = source_segments[track_id]
+            source_start_idx = max(0, source_end_idx - VIZ_STYLE['merge_source_tail_points'] + 1)
+            source_trace = trace[source_start_idx:source_end_idx + 1]
+            if len(source_trace) >= 2:
+                ax.plot(
+                    source_trace[:, 0], source_trace[:, 1],
+                    color=mcolors.to_rgba('white', 0.98),
+                    linewidth=VIZ_STYLE['merge_highlight_width'] + 1.6,
+                    solid_capstyle='round',
+                    zorder=4,
+                )
+                ax.plot(
+                    source_trace[:, 0], source_trace[:, 1],
+                    color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.88),
+                    linewidth=VIZ_STYLE['merge_highlight_width'] - 0.3,
+                    solid_capstyle='round',
+                    zorder=5,
+                )
+                ax.scatter(
+                    source_trace[:, 0], source_trace[:, 1],
+                    color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.92),
+                    s=16,
+                    edgecolors='white',
+                    linewidths=0.25,
+                    zorder=6,
+                )
+
         if track_id in highlighted_segments and len(trace) - highlighted_segments[track_id] >= 2:
-            merge_trace = trace[highlighted_segments[track_id]:]
+            child_start_idx = highlighted_segments[track_id]
+            child_end_idx = min(len(trace), child_start_idx + VIZ_STYLE['merge_child_head_points'])
+            merge_trace = trace[child_start_idx:child_end_idx]
             highlight_color = adjust_color(color, VIZ_STYLE['merge_highlight_factor'])
             ax.plot(
                 merge_trace[:, 0], merge_trace[:, 1],
@@ -668,6 +721,23 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             marker='P',
             edgecolors='white',
             linewidths=0.8,
+            zorder=10,
+        )
+        ax.text(
+            point[0] + 10,
+            point[1] + 8,
+            'merge',
+            color=VIZ_STYLE['merge_arrow_color'],
+            fontsize=VIZ_STYLE['label_fontsize'],
+            fontweight='semibold',
+            ha='left',
+            va='bottom',
+            bbox=dict(
+                boxstyle='round,pad=0.2',
+                fc=mcolors.to_rgba('white', 0.9),
+                ec=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.4),
+                lw=0.8,
+            ),
             zorder=10,
         )
 
