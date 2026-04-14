@@ -1,7 +1,10 @@
 import os
-# 添加根目录路径
 import sys
+from collections import defaultdict
+
+# 添加根目录路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,17 +12,17 @@ import matplotlib.animation as animation
 import matplotlib.colors as mcolors
 from matplotlib import font_manager
 from matplotlib.patches import Polygon
-from scipy.optimize import linear_sum_assignment
 from scipy.spatial import ConvexHull, QhullError
-from sklearn.cluster import DBSCAN
 from sklearn.metrics import accuracy_score
-from sklearn.metrics.pairwise import euclidean_distances
 
 import config
 from model import GNNGroupTracker
 from dataset import RadarFileDataset
-from trackers.gnn_processor import GNNPostProcessor
-from trackers.gnn_processor_all import GROUP_TO_CLUSTER_THRESH, build_group_detections
+from trackers.gnn_processor_all import (
+    GROUP_TO_CLUSTER_THRESH,
+    HierarchicalTrackProcessor,
+    assign_track_ids_to_points,
+)
 
 
 NUM = 20  # 选择第几个样本 episode
@@ -58,19 +61,6 @@ VIZ_STYLE = {
     'tail_length': None,
     'ghost_age': 3,
     'ghost_alpha_scale': 0.62,
-    'inherit_dist_thresh': 26.0,
-    'inherit_history_frames': 4,
-    'bridge_frames': 6,
-    'bridge_alpha': 0.52,
-    'bridge_width': 1.5,
-    'merge_marker_outer_size': 84,
-    'merge_marker_inner_size': 42,
-    'merge_bridge_width_boost': 1.1,
-    'merge_arrow_width': 3.2,
-    'merge_arrow_head_scale': 24,
-    'merge_arrow_outline_width': 5.0,
-    'merge_detect_thresh': 72.0,
-    'merge_arrow_color': '#D84B3A',
     'continuous_width': 3.2,
     'continuous_alpha': 0.92,
     'continuous_point_size': 16,
@@ -83,6 +73,20 @@ VIZ_STYLE = {
     'label_fontsize': 9,
     'info_fontsize': 10,
     'margin_ratio': 0.08,
+    'relation_frames': 6,
+    'relation_min_support_points': 3,
+    'relation_min_parent_ratio': 0.25,
+    'relation_min_child_ratio': 0.25,
+    'relation_arrow_width': 2.8,
+    'relation_arrow_head_scale': 22,
+    'relation_arrow_outline_width': 4.6,
+    'relation_merge_color': '#D84B3A',
+    'relation_split_color': '#2D8C82',
+    'relation_birth_color': '#7B8794',
+    'relation_alpha': 0.88,
+    'relation_label_fontsize': 8.5,
+    'relation_marker_outer_size': 94,
+    'relation_marker_inner_size': 48,
 }
 
 COLOR_PALETTE = [
@@ -149,216 +153,239 @@ def adjust_color(color, factor):
     return tuple(np.clip(rgb * factor, 0.0, 1.0))
 
 
-def build_display_trace(base_trace, inherited_prefix):
-    trace_parts = []
-    if len(inherited_prefix):
-        trace_parts.append(np.asarray(inherited_prefix, dtype=float))
-    if len(base_trace):
-        base_arr = np.asarray(base_trace, dtype=float)
-        if trace_parts and np.allclose(trace_parts[-1][-1], base_arr[0]):
-            base_arr = base_arr[1:]
-        if len(base_arr):
-            trace_parts.append(base_arr)
-
-    if not trace_parts:
-        return np.empty((0, 2), dtype=float)
-
-    return np.vstack(trace_parts)
+def build_center_lookup(group_ids, group_centers):
+    group_ids = np.asarray(group_ids, dtype=int).reshape(-1)
+    group_centers = np.asarray(group_centers, dtype=float).reshape(-1, 2)
+    return {int(gid): np.asarray(center, dtype=float) for gid, center in zip(group_ids, group_centers)}
 
 
-def compute_display_tracks(gnn_processor, lineage_meta, bridge_events):
+def format_group_ids(group_ids):
+    return ' + '.join(f'G{int(group_id)}' for group_id in group_ids)
+
+
+def compute_display_tracks(group_tracker):
     display_tracks = {}
-    for track_id, trk in gnn_processor.tracks.items():
-        root_id = lineage_meta.get(track_id, {}).get('root_id', track_id)
-        generation = lineage_meta.get(track_id, {}).get('generation', 0)
-        base_color = get_track_color(root_id)
-        color_factor = 1.0 + min(generation, 3) * 0.08
-        trace = build_display_trace(
-            trk.get('trace', []),
-            lineage_meta.get(track_id, {}).get('inherited_prefix', np.empty((0, 2), dtype=float)),
-        )
+    for track_id, trk in group_tracker.tracks.items():
+        color = get_track_color(track_id)
         display_tracks[track_id] = {
-            'root_id': root_id,
-            'generation': generation,
-            'parents': tuple(lineage_meta.get(track_id, {}).get('parents', ())),
-            'trace': trace,
+            'trace': np.asarray(trk.get('trace', []), dtype=float),
             'age': int(trk.get('age', 0)),
             'is_observed': int(trk.get('age', 0)) == 0,
             'center': np.asarray(trk.get('last_meas', trk['x'][:2]), dtype=float),
             'pred_center': np.asarray(trk['x'][:2], dtype=float),
-            'color': adjust_color(base_color, color_factor),
+            'color': color,
             'shape': np.asarray(trk.get('shape', np.array([3.0, 3.0])), dtype=float),
         }
-
-    for event in bridge_events:
-        child_id = event['child_id']
-        if child_id in display_tracks:
-            display_tracks[child_id].setdefault('bridges', []).append(event)
-
     return display_tracks
 
 
-def compute_raw_tracks(gnn_processor, lineage_meta):
+def compute_raw_tracks(group_tracker):
     raw_tracks = {}
-    for track_id, trk in gnn_processor.tracks.items():
-        root_id = lineage_meta.get(track_id, {}).get('root_id', track_id)
-        generation = lineage_meta.get(track_id, {}).get('generation', 0)
-        base_color = get_track_color(root_id)
-        color_factor = 1.0 + min(generation, 3) * 0.08
+    for track_id, trk in group_tracker.tracks.items():
         raw_tracks[track_id] = {
             'trace': np.asarray(trk.get('trace', []), dtype=float),
-            'color': adjust_color(base_color, color_factor),
-            'root_id': root_id,
+            'color': get_track_color(track_id),
             'age': int(trk.get('age', 0)),
         }
     return raw_tracks
 
 
-def update_recent_history(recent_history, display_tracks, frame_idx):
-    for track_id, info in display_tracks.items():
-        recent_history.setdefault(track_id, []).append({
-            'frame_idx': frame_idx,
-            'center': np.asarray(info['center'], dtype=float),
-            'trace': np.asarray(info['trace'], dtype=float),
-            'root_id': info['root_id'],
-            'generation': info['generation'],
-        })
-        recent_history[track_id] = recent_history[track_id][-VIZ_STYLE['inherit_history_frames']:]
+def _relation_pair_is_valid(count, parent_total, child_total):
+    if count < VIZ_STYLE['relation_min_support_points']:
+        return False
+    if parent_total <= 0 or child_total <= 0:
+        return False
+    parent_ratio = count / parent_total
+    child_ratio = count / child_total
+    return (
+        parent_ratio >= VIZ_STYLE['relation_min_parent_ratio']
+        and child_ratio >= VIZ_STYLE['relation_min_child_ratio']
+    )
 
 
-def create_lineage_events(new_track_ids, prev_track_ids, display_tracks, recent_history, frame_idx):
-    events = []
-    if not new_track_ids or not prev_track_ids:
-        return events
+def infer_frame_relations(prev_frame, curr_frame, frame_idx):
+    curr_point_group_ids = np.asarray(curr_frame.get('point_group_ids', []), dtype=int).reshape(-1)
+    curr_group_ids = np.asarray(curr_frame.get('group_ids', []), dtype=int).reshape(-1)
+    curr_group_centers = np.asarray(curr_frame.get('group_centers', np.empty((0, 2))), dtype=float).reshape(-1, 2)
+    curr_detected_centers = np.asarray(curr_frame.get('detected_centers', np.empty((0, 2))), dtype=float).reshape(-1, 2)
+    curr_centroid_to_points = curr_frame.get('centroid_to_points', {})
+    curr_num_points = len(curr_frame.get('plot_pos', np.empty((0, 2))))
 
-    child_candidates = []
-    for child_id in new_track_ids:
-        child_info = display_tracks.get(child_id)
-        if child_info is None:
+    curr_center_lookup = build_center_lookup(curr_group_ids, curr_group_centers)
+    curr_frame['prev_point_group_ids'] = np.full(curr_num_points, -1, dtype=int)
+
+    if prev_frame is None:
+        relations = []
+        for child_id in sorted(curr_group_ids):
+            child_center = curr_center_lookup.get(int(child_id))
+            relations.append({
+                'type': 'birth',
+                'frame_idx': frame_idx,
+                'parents': tuple(),
+                'children': (int(child_id),),
+                'support_count': 0,
+                'support_details': tuple(),
+                'parent_centers': [],
+                'child_centers': [child_center] if child_center is not None else [],
+                'anchor': child_center,
+                'label': f'G{int(child_id)}',
+            })
+        return relations
+
+    prev_group_ids = np.asarray(prev_frame.get('group_ids', []), dtype=int).reshape(-1)
+    prev_group_centers = np.asarray(prev_frame.get('group_centers', np.empty((0, 2))), dtype=float).reshape(-1, 2)
+    prev_center_lookup = build_center_lookup(prev_group_ids, prev_group_centers)
+
+    prev_point_group_ids = assign_track_ids_to_points(
+        prev_group_centers,
+        prev_group_ids,
+        curr_detected_centers,
+        curr_centroid_to_points,
+        curr_num_points,
+        GROUP_TO_CLUSTER_THRESH,
+    )
+    curr_frame['prev_point_group_ids'] = prev_point_group_ids
+
+    pair_counts = defaultdict(int)
+    parent_totals = defaultdict(int)
+    child_totals = defaultdict(int)
+
+    for parent_id in prev_point_group_ids[prev_point_group_ids >= 0]:
+        parent_totals[int(parent_id)] += 1
+    for child_id in curr_point_group_ids[curr_point_group_ids >= 0]:
+        child_totals[int(child_id)] += 1
+
+    valid_mask = (prev_point_group_ids >= 0) & (curr_point_group_ids >= 0)
+    for parent_id, child_id in zip(prev_point_group_ids[valid_mask], curr_point_group_ids[valid_mask]):
+        pair_counts[(int(parent_id), int(child_id))] += 1
+
+    child_supports = defaultdict(list)
+    parent_supports = defaultdict(list)
+    for (parent_id, child_id), count in sorted(pair_counts.items()):
+        parent_total = parent_totals[parent_id]
+        child_total = child_totals[child_id]
+        parent_ratio = count / parent_total if parent_total > 0 else 0.0
+        child_ratio = count / child_total if child_total > 0 else 0.0
+        if not _relation_pair_is_valid(count, parent_total, child_total):
             continue
-        child_center = np.asarray(child_info['center'], dtype=float)
-        candidates = []
-        for parent_id in prev_track_ids:
-            history = recent_history.get(parent_id)
-            if not history:
-                continue
-            parent_snapshot = history[-1]
-            parent_center = np.asarray(parent_snapshot['center'], dtype=float)
-            distance = float(np.linalg.norm(child_center - parent_center))
-            if distance <= VIZ_STYLE['inherit_dist_thresh']:
-                candidates.append((distance, parent_id, parent_snapshot))
-        if candidates:
-            child_candidates.append((child_id, sorted(candidates, key=lambda item: item[0])))
-
-    if not child_candidates:
-        return events
-
-    parent_children = {}
-    for child_id, candidates in child_candidates:
-        _, best_parent, best_snapshot = candidates[0]
-        parent_children.setdefault(best_parent, []).append((child_id, best_snapshot))
-
-    split_parents = {pid for pid, childs in parent_children.items() if len(childs) > 1}
-
-    child_all_candidates = {child_id: candidates for child_id, candidates in child_candidates}
-    merge_children = set()
-    for child_id, candidates in child_all_candidates.items():
-        close_candidates = [item for item in candidates if item[0] <= VIZ_STYLE['inherit_dist_thresh']]
-        if len(close_candidates) > 1:
-            merge_children.add(child_id)
-
-    handled_pairs = set()
-    for child_id in sorted(merge_children):
-        candidates = child_all_candidates[child_id]
-        parents = [item[1] for item in candidates]
-        parent_snapshots = {item[1]: item[2] for item in candidates}
-        primary_parent = candidates[0][1]
-        primary_snapshot = parent_snapshots[primary_parent]
-        events.append({
-            'type': 'merge',
+        support = {
+            'parent_id': parent_id,
             'child_id': child_id,
+            'count': int(count),
+            'parent_ratio': float(parent_ratio),
+            'child_ratio': float(child_ratio),
+        }
+        child_supports[child_id].append(support)
+        parent_supports[parent_id].append(support)
+
+    for child_id in child_supports:
+        child_supports[child_id].sort(key=lambda item: (-item['count'], -item['parent_ratio'], item['parent_id']))
+    for parent_id in parent_supports:
+        parent_supports[parent_id].sort(key=lambda item: (-item['count'], -item['child_ratio'], item['child_id']))
+
+    relations = []
+    merge_children = {child_id for child_id, supports in child_supports.items() if len(supports) >= 2}
+    split_parents = {parent_id for parent_id, supports in parent_supports.items() if len(supports) >= 2}
+
+    for child_id in sorted(merge_children):
+        supports = child_supports[child_id]
+        parents = tuple(int(item['parent_id']) for item in supports)
+        child_center = curr_center_lookup.get(int(child_id))
+        parent_centers = [prev_center_lookup[parent_id] for parent_id in parents if parent_id in prev_center_lookup]
+        relations.append({
+            'type': 'merge',
+            'frame_idx': frame_idx,
             'parents': parents,
-            'primary_parent': primary_parent,
-            'root_id': primary_snapshot['root_id'],
-            'generation': primary_snapshot['generation'] + 1,
-            'prefix': np.asarray(primary_snapshot['trace'], dtype=float),
-            'bridges': [
-                {
-                    'start': np.asarray(parent_snapshots[parent_id]['center'], dtype=float),
-                    'end': np.asarray(display_tracks[child_id]['center'], dtype=float),
-                    'start_frame': frame_idx,
-                    'type': 'merge',
-                }
-                for parent_id in parents
-            ],
+            'children': (int(child_id),),
+            'support_count': int(sum(item['count'] for item in supports)),
+            'support_details': tuple(supports),
+            'parent_centers': parent_centers,
+            'child_centers': [child_center] if child_center is not None else [],
+            'anchor': child_center,
+            'label': f'{format_group_ids(parents)} -> G{int(child_id)}',
         })
-        handled_pairs.add((primary_parent, child_id))
 
     for parent_id in sorted(split_parents):
-        children = parent_children[parent_id]
-        parent_snapshot = children[0][1]
-        for child_id, _ in children:
-            if child_id in merge_children:
-                continue
-            events.append({
-                'type': 'split',
-                'child_id': child_id,
-                'parents': [parent_id],
-                'primary_parent': parent_id,
-                'root_id': parent_snapshot['root_id'],
-                'generation': parent_snapshot['generation'] + 1,
-                'prefix': np.asarray(parent_snapshot['trace'], dtype=float),
-                'bridges': [{
-                    'start': np.asarray(parent_snapshot['center'], dtype=float),
-                    'end': np.asarray(display_tracks[child_id]['center'], dtype=float),
-                    'start_frame': frame_idx,
-                    'type': 'split',
-                }],
-            })
-            handled_pairs.add((parent_id, child_id))
-
-    for child_id, candidates in child_candidates:
-        if child_id in merge_children:
-            continue
-        best_distance, best_parent, best_snapshot = candidates[0]
-        if (best_parent, child_id) in handled_pairs:
-            continue
-        events.append({
-            'type': 'inherit',
-            'child_id': child_id,
-            'parents': [best_parent],
-            'primary_parent': best_parent,
-            'root_id': best_snapshot['root_id'],
-            'generation': best_snapshot['generation'] + 1,
-            'prefix': np.asarray(best_snapshot['trace'], dtype=float),
-            'bridges': [{
-                'start': np.asarray(best_snapshot['center'], dtype=float),
-                'end': np.asarray(display_tracks[child_id]['center'], dtype=float),
-                'start_frame': frame_idx,
-                'type': 'inherit',
-            }],
+        supports = parent_supports[parent_id]
+        children = tuple(int(item['child_id']) for item in supports)
+        parent_center = prev_center_lookup.get(int(parent_id))
+        child_centers = [curr_center_lookup[child_id] for child_id in children if child_id in curr_center_lookup]
+        relations.append({
+            'type': 'split',
+            'frame_idx': frame_idx,
+            'parents': (int(parent_id),),
+            'children': children,
+            'support_count': int(sum(item['count'] for item in supports)),
+            'support_details': tuple(supports),
+            'parent_centers': [parent_center] if parent_center is not None else [],
+            'child_centers': child_centers,
+            'anchor': parent_center,
+            'label': f'G{int(parent_id)} -> {format_group_ids(children)}',
         })
 
-    deduped = {}
-    for event in events:
-        child_id = event['child_id']
-        priority = {'merge': 0, 'split': 1, 'inherit': 2}[event['type']]
-        existing = deduped.get(child_id)
-        if existing is None or priority < existing[0]:
-            deduped[child_id] = (priority, event)
-    return [item[1] for item in deduped.values()]
+    used_pairs = set()
+    for child_id, supports in child_supports.items():
+        if child_id in merge_children:
+            used_pairs.update((item['parent_id'], item['child_id']) for item in supports)
+            continue
+        if len(supports) != 1:
+            continue
+        support = supports[0]
+        parent_id = int(support['parent_id'])
+        if parent_id in split_parents:
+            used_pairs.add((parent_id, int(child_id)))
+            continue
+        child_center = curr_center_lookup.get(int(child_id))
+        parent_center = prev_center_lookup.get(parent_id)
+        relations.append({
+            'type': 'continue',
+            'frame_idx': frame_idx,
+            'parents': (parent_id,),
+            'children': (int(child_id),),
+            'support_count': int(support['count']),
+            'support_details': (support,),
+            'parent_centers': [parent_center] if parent_center is not None else [],
+            'child_centers': [child_center] if child_center is not None else [],
+            'anchor': child_center if child_center is not None else parent_center,
+            'label': f'G{parent_id} -> G{int(child_id)}',
+        })
+        used_pairs.add((parent_id, int(child_id)))
 
+    supported_children = set(child_supports.keys())
+    supported_parents = set(parent_supports.keys())
 
-def apply_lineage_events(lineage_meta, bridge_events, events):
-    for event in events:
-        child_id = event['child_id']
-        lineage_meta[child_id] = {
-            'root_id': event['root_id'],
-            'parents': tuple(event['parents']),
-            'generation': event['generation'],
-            'inherited_prefix': np.asarray(event['prefix'], dtype=float),
-        }
-        bridge_events.extend(event['bridges'])
+    for child_id in sorted(int(group_id) for group_id in curr_group_ids if int(group_id) not in supported_children):
+        child_center = curr_center_lookup.get(child_id)
+        relations.append({
+            'type': 'birth',
+            'frame_idx': frame_idx,
+            'parents': tuple(),
+            'children': (child_id,),
+            'support_count': 0,
+            'support_details': tuple(),
+            'parent_centers': [],
+            'child_centers': [child_center] if child_center is not None else [],
+            'anchor': child_center,
+            'label': f'G{child_id}',
+        })
+
+    for parent_id in sorted(int(group_id) for group_id in prev_group_ids if int(group_id) not in supported_parents):
+        parent_center = prev_center_lookup.get(parent_id)
+        relations.append({
+            'type': 'death',
+            'frame_idx': frame_idx,
+            'parents': (parent_id,),
+            'children': tuple(),
+            'support_count': 0,
+            'support_details': tuple(),
+            'parent_centers': [parent_center] if parent_center is not None else [],
+            'child_centers': [],
+            'anchor': parent_center,
+            'label': f'G{parent_id}',
+        })
+
+    relations.sort(key=lambda item: ({'merge': 0, 'split': 1, 'continue': 2, 'birth': 3, 'death': 4}[item['type']], item['label']))
+    return relations
 
 
 def compute_scene_limits(viz_frames):
@@ -371,11 +398,15 @@ def compute_scene_limits(viz_frames):
         if data['centers']:
             collected.append(np.vstack(list(data['centers'].values())))
         for track_info in data.get('display_tracks', {}).values():
-            trace = np.asarray(track_info.get('trace', []))
+            trace = np.asarray(track_info.get('trace', []), dtype=float)
             if trace.size:
                 collected.append(trace)
-            for bridge in track_info.get('bridges', []):
-                collected.append(np.vstack([bridge['start'], bridge['end']]))
+        for relation in data.get('relations', []):
+            relation_points = []
+            relation_points.extend(relation.get('parent_centers', []))
+            relation_points.extend(relation.get('child_centers', []))
+            if relation_points:
+                collected.append(np.vstack(relation_points))
 
     if not collected:
         return (-1.0, 1.0), (-1.0, 1.0)
@@ -443,7 +474,7 @@ def draw_group_region(ax, points, color):
 
 
 def draw_fading_trail(ax, trace, color, alpha_scale=1.0):
-    trace = np.asarray(trace)
+    trace = np.asarray(trace, dtype=float)
     if len(trace) < 2:
         return
 
@@ -465,20 +496,140 @@ def draw_fading_trail(ax, trace, color, alpha_scale=1.0):
         )
 
 
-def draw_bridge(ax, bridge, color, frame_idx):
-    age = frame_idx - bridge['start_frame']
-    if age < 0 or age >= VIZ_STYLE['bridge_frames']:
+def _draw_relation_arrow(ax, start, end, color, alpha, zorder):
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    if np.linalg.norm(end - start) < 1e-6:
         return
 
-    fade = 1.0 - age / max(VIZ_STYLE['bridge_frames'], 1)
-    ax.plot(
-        [bridge['start'][0], bridge['end'][0]],
-        [bridge['start'][1], bridge['end'][1]],
-        color=mcolors.to_rgba(color, VIZ_STYLE['bridge_alpha'] * fade),
-        linewidth=VIZ_STYLE['bridge_width'],
-        linestyle='--',
-        solid_capstyle='round',
-        zorder=2,
+    ax.annotate(
+        '',
+        xy=end,
+        xytext=start,
+        arrowprops=dict(
+            arrowstyle='-|>',
+            color=mcolors.to_rgba('white', min(alpha + 0.08, 0.98)),
+            lw=VIZ_STYLE['relation_arrow_outline_width'],
+            shrinkA=8,
+            shrinkB=8,
+            mutation_scale=VIZ_STYLE['relation_arrow_head_scale'],
+        ),
+        zorder=zorder,
+    )
+    ax.annotate(
+        '',
+        xy=end,
+        xytext=start,
+        arrowprops=dict(
+            arrowstyle='-|>',
+            color=mcolors.to_rgba(color, alpha),
+            lw=VIZ_STYLE['relation_arrow_width'],
+            shrinkA=8,
+            shrinkB=8,
+            mutation_scale=VIZ_STYLE['relation_arrow_head_scale'],
+        ),
+        zorder=zorder + 0.1,
+    )
+
+
+def _relation_color(relation_type):
+    if relation_type == 'merge':
+        return VIZ_STYLE['relation_merge_color']
+    if relation_type == 'split':
+        return VIZ_STYLE['relation_split_color']
+    return VIZ_STYLE['relation_birth_color']
+
+
+def draw_relation_event(ax, relation, current_frame_idx=None, overview=False):
+    relation_type = relation.get('type')
+    if relation_type not in {'merge', 'split'}:
+        return
+
+    if overview:
+        fade = 1.0
+    else:
+        age = current_frame_idx - int(relation['frame_idx'])
+        if age < 0 or age >= VIZ_STYLE['relation_frames']:
+            return
+        fade = 1.0 - age / max(VIZ_STYLE['relation_frames'], 1)
+
+    color = _relation_color(relation_type)
+    alpha = VIZ_STYLE['relation_alpha'] * fade
+
+    if relation_type == 'merge':
+        child_centers = relation.get('child_centers', [])
+        if not child_centers:
+            return
+        child_center = np.asarray(child_centers[0], dtype=float)
+        for parent_center in relation.get('parent_centers', []):
+            _draw_relation_arrow(ax, parent_center, child_center, color, alpha, zorder=8)
+
+        ax.scatter(
+            child_center[0], child_center[1],
+            s=VIZ_STYLE['relation_marker_outer_size'],
+            color=mcolors.to_rgba('white', min(alpha + 0.04, 0.98)),
+            edgecolors='none',
+            zorder=9,
+        )
+        ax.scatter(
+            child_center[0], child_center[1],
+            s=VIZ_STYLE['relation_marker_inner_size'],
+            color=mcolors.to_rgba(color, alpha),
+            marker='P',
+            edgecolors='white',
+            linewidths=0.8,
+            zorder=10,
+        )
+        anchor = child_center
+    else:
+        parent_centers = relation.get('parent_centers', [])
+        if not parent_centers:
+            return
+        parent_center = np.asarray(parent_centers[0], dtype=float)
+        for child_center in relation.get('child_centers', []):
+            _draw_relation_arrow(ax, parent_center, child_center, color, alpha, zorder=8)
+
+        ax.scatter(
+            parent_center[0], parent_center[1],
+            s=VIZ_STYLE['relation_marker_outer_size'],
+            color=mcolors.to_rgba('white', min(alpha + 0.04, 0.98)),
+            edgecolors='none',
+            zorder=9,
+        )
+        ax.scatter(
+            parent_center[0], parent_center[1],
+            s=VIZ_STYLE['relation_marker_inner_size'],
+            color=mcolors.to_rgba(color, alpha),
+            marker='X',
+            edgecolors='white',
+            linewidths=0.8,
+            zorder=10,
+        )
+        anchor = parent_center
+
+    offset = (10, 9) if (int(relation['frame_idx']) + (0 if relation_type == 'merge' else 1)) % 2 else (10, -16)
+    va = 'bottom' if offset[1] > 0 else 'top'
+    label = relation['label']
+    if overview:
+        label = f'{label}\n(t={int(relation["frame_idx"]):02d})'
+
+    ax.annotate(
+        label,
+        xy=(anchor[0], anchor[1]),
+        xytext=offset,
+        textcoords='offset points',
+        color=color,
+        fontsize=VIZ_STYLE['relation_label_fontsize'],
+        fontweight='semibold',
+        ha='left',
+        va=va,
+        bbox=dict(
+            boxstyle='round,pad=0.24',
+            fc=mcolors.to_rgba('white', 0.90),
+            ec=mcolors.to_rgba(color, min(alpha, 0.65)),
+            lw=0.85,
+        ),
+        zorder=11,
     )
 
 
@@ -495,13 +646,12 @@ def collect_overview_tracks(viz_frames, field_name):
                 overview_tracks[track_id] = {
                     'trace': trace.copy(),
                     'color': track_info['color'],
-                    'root_id': track_info.get('root_id', track_id),
                 }
 
     return overview_tracks
 
 
-def save_track_overview(viz_frames, xlim, ylim, labels):
+def save_track_overview(viz_frames, xlim, ylim, labels, relation_events):
     raw_overview_tracks = collect_overview_tracks(viz_frames, 'raw_tracks')
     continuous_overview_tracks = collect_overview_tracks(viz_frames, 'display_tracks')
     if not raw_overview_tracks and not continuous_overview_tracks:
@@ -511,61 +661,6 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     fig.patch.set_facecolor(VIZ_STYLE['background'])
     fig.subplots_adjust(left=0.11, right=0.97, bottom=0.10, top=0.97)
     style_axes(ax)
-
-    merge_events = []
-    prev_group_ids = set()
-    prev_group_centers = {}
-    prev_group_points = {}
-    prev_frame_idx = None
-    for frame_idx, data in enumerate(viz_frames):
-        plot_pos = np.asarray(data.get('plot_pos', np.empty((0, 2))), dtype=float).reshape(-1, 2)
-        cluster_labels, detected_centers, centroid_to_points, _ = build_group_detections(
-            plot_pos,
-            eps=config.POINT_CLUSTER_EPS,
-            min_samples=config.POINT_CLUSTER_MIN_SAMPLES,
-        )
-        current_group_ids = set(int(gid) for gid in np.unique(data.get('track_ids', np.array([], dtype=int))) if int(gid) > 0)
-        current_group_centers = {int(gid): np.asarray(center, dtype=float) for gid, center in data.get('centers', {}).items()}
-        current_group_points = {}
-        for det_idx, point_indices in centroid_to_points.items():
-            point_indices = np.asarray(point_indices, dtype=int)
-            point_ids = data['track_ids'][point_indices]
-            valid_ids = point_ids[point_ids > 0]
-            if len(valid_ids) == 0:
-                continue
-            uniq_ids, counts = np.unique(valid_ids, return_counts=True)
-            owner_gid = int(uniq_ids[np.argmax(counts)])
-            current_group_points[owner_gid] = np.asarray(point_indices, dtype=int)
-
-        if prev_frame_idx is not None:
-            vanished_group_ids = prev_group_ids - current_group_ids
-            for child_gid, child_points in current_group_points.items():
-                parent_ids = []
-                for parent_gid in sorted(vanished_group_ids):
-                    parent_center = prev_group_centers.get(parent_gid)
-                    child_center = current_group_centers.get(child_gid)
-                    parent_points = prev_group_points.get(parent_gid)
-                    if parent_center is None or child_center is None or parent_points is None:
-                        continue
-                    if len(parent_points) == 0 or len(child_points) == 0:
-                        continue
-                    distance = float(np.linalg.norm(child_center - parent_center))
-                    if distance > GROUP_TO_CLUSTER_THRESH * 2.0:
-                        continue
-                    parent_ids.append(parent_gid)
-                if len(parent_ids) >= 2:
-                    merge_events.append({
-                        'frame_idx': frame_idx,
-                        'parent_ids': tuple(parent_ids),
-                        'child_id': child_gid,
-                        'child_center': np.asarray(current_group_centers[child_gid], dtype=float),
-                        'parent_centers': [np.asarray(prev_group_centers[parent_gid], dtype=float) for parent_gid in parent_ids],
-                    })
-
-        prev_group_ids = current_group_ids
-        prev_group_centers = current_group_centers
-        prev_group_points = current_group_points
-        prev_frame_idx = frame_idx
 
     for track_id in sorted(raw_overview_tracks):
         track_info = raw_overview_tracks[track_id]
@@ -649,47 +744,8 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             zorder=8,
         )
 
-    for event in merge_events:
-        child_id = event['child_id']
-        child_track = continuous_overview_tracks.get(child_id)
-        child_color = adjust_color(child_track['color'], VIZ_STYLE['continuous_lighten_factor']) if child_track else get_track_color(child_id)
-        for parent_center in event['parent_centers']:
-            ax.plot(
-                [parent_center[0], event['child_center'][0]],
-                [parent_center[1], event['child_center'][1]],
-                color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], VIZ_STYLE['merge_link_alpha']),
-                linewidth=VIZ_STYLE['merge_link_width'],
-                linestyle='--',
-                solid_capstyle='round',
-                zorder=6,
-            )
-        ax.scatter(
-            event['child_center'][0], event['child_center'][1],
-            s=VIZ_STYLE['merge_marker_size'],
-            color=VIZ_STYLE['merge_arrow_color'],
-            marker='P',
-            edgecolors='white',
-            linewidths=0.9,
-            zorder=7,
-        )
-        ax.annotate(
-            ' + '.join(f'G{pid}' for pid in event['parent_ids']) + f' -> G{child_id}',
-            xy=(event['child_center'][0], event['child_center'][1]),
-            xytext=(8, 8),
-            textcoords='offset points',
-            color=VIZ_STYLE['merge_arrow_color'],
-            fontsize=VIZ_STYLE['label_fontsize'],
-            fontweight='semibold',
-            ha='left',
-            va='bottom',
-            bbox=dict(
-                boxstyle='round,pad=0.22',
-                fc=mcolors.to_rgba('white', 0.9),
-                ec=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], 0.45),
-                lw=0.8,
-            ),
-            zorder=8,
-        )
+    for relation in relation_events:
+        draw_relation_event(ax, relation, overview=True)
 
     info_text = (
         f'{labels["frame"]}: 00-{len(viz_frames) - 1:02d}\n'
@@ -703,7 +759,7 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
         fontsize=VIZ_STYLE['info_fontsize'],
         color=VIZ_STYLE['text_color'],
         bbox=dict(boxstyle='round,pad=0.35', fc=mcolors.to_rgba('white', 0.80), ec='none'),
-        zorder=10,
+        zorder=12,
     )
 
     ax.set_xlim(*xlim)
@@ -717,66 +773,6 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     fig.savefig(overview_path, dpi=VIZ_STYLE['dpi'], bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close(fig)
     return overview_path
-
-
-def build_gnn_detections(raw_pos, corrected_pos):
-    if len(corrected_pos) == 0:
-        return np.empty((0, 2)), None, []
-
-    try:
-        labels = DBSCAN(eps=30, min_samples=3).fit(corrected_pos).labels_
-    except Exception:
-        labels = np.full(len(corrected_pos), -1)
-
-    det_centers = []
-    det_shapes = []
-    cluster_indices_list = []
-
-    for label in set(labels):
-        if label == -1:
-            continue
-        indices = np.where(labels == label)[0]
-        cluster_indices_list.append(indices)
-
-        det_centers.append(np.mean(corrected_pos[indices], axis=0))
-
-        pts_raw = raw_pos[indices]
-        if len(pts_raw) > 1:
-            lower = np.percentile(pts_raw, 5, axis=0)
-            upper = np.percentile(pts_raw, 95, axis=0)
-            wh = upper - lower
-        else:
-            wh = np.array([0.0, 0.0])
-        det_shapes.append(np.maximum(wh, 3.0))
-
-    det_centers = np.array(det_centers).reshape(-1, 2)
-    det_shapes = np.array(det_shapes).reshape(-1, 2)
-    if len(det_shapes) == 0:
-        det_shapes = None
-
-    return det_centers, det_shapes, cluster_indices_list
-
-
-def assign_tracks_to_points(pred_centers, pred_track_ids, det_centers, cluster_indices_list, num_nodes):
-    point_track_ids = np.full(num_nodes, -1, dtype=int)
-    centers = {}
-    matched_track_ids = set()
-
-    if len(pred_centers) == 0 or len(det_centers) == 0:
-        return point_track_ids, centers, matched_track_ids
-
-    cost_matrix = euclidean_distances(pred_centers, det_centers)
-    row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-    for r, c in zip(row_ind, col_ind):
-        if cost_matrix[r, c] < 20.0:
-            track_id = int(pred_track_ids[r])
-            point_indices = cluster_indices_list[c]
-            point_track_ids[point_indices] = track_id
-            centers[track_id] = pred_centers[r]
-            matched_track_ids.add(track_id)
-
-    return point_track_ids, centers, matched_track_ids
 
 
 def compute_edge_accuracy(edge_scores, graph):
@@ -793,7 +789,7 @@ def compute_edge_accuracy(edge_scores, graph):
 
 
 # ==========================================
-# 推理主流程（与 evaluate.py 主线对齐）
+# 推理主流程（对齐 evaluate_all.py 的 group tracking 标签维系）
 # ==========================================
 def run_inference_and_viz():
     labels = configure_text_labels()
@@ -816,14 +812,11 @@ def run_inference_and_viz():
         return
     episode_graphs = test_set.get(NUM)
 
-    gnn_processor = GNNPostProcessor()
-    lineage_meta = {}
-    bridge_events = []
-    recent_history = {}
-    prev_track_ids = set()
-    seen_track_ids = set()
-
+    track_processor = HierarchicalTrackProcessor()
+    prev_frame_state = None
     viz_frames = []
+    all_relation_events = []
+
     print(f'Starting inference on {len(episode_graphs)} frames...')
 
     with torch.no_grad():
@@ -836,18 +829,35 @@ def run_inference_and_viz():
                 'raw_pos': raw_pos,
                 'plot_pos': raw_pos.copy(),
                 'track_ids': np.full(num_nodes, -1, dtype=int),
+                'point_group_ids': np.full(num_nodes, -1, dtype=int),
+                'prev_point_group_ids': np.full(num_nodes, -1, dtype=int),
+                'group_ids': np.zeros((0,), dtype=int),
+                'group_centers': np.zeros((0, 2), dtype=float),
+                'detected_centers': np.zeros((0, 2), dtype=float),
+                'detected_shapes': None,
+                'centroid_to_points': {},
                 'centers': {},
                 'acc': 0.0,
                 'display_tracks': {},
                 'raw_tracks': {},
+                'relations': [],
             }
 
             if num_nodes == 0:
-                gnn_processor.update(np.empty((0, 2)), None)
-                frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
-                frame_data['raw_tracks'] = compute_raw_tracks(gnn_processor, lineage_meta)
-                update_recent_history(recent_history, frame_data['display_tracks'], t)
-                prev_track_ids = set(frame_data['display_tracks'].keys())
+                group_out = track_processor.update_group_tracks(np.empty((0, 2)))
+                frame_data['group_ids'] = group_out['group_ids']
+                frame_data['group_centers'] = group_out['group_centers']
+                frame_data['detected_centers'] = group_out['detected_centers']
+                frame_data['detected_shapes'] = group_out['detected_shapes']
+                frame_data['centroid_to_points'] = group_out['centroid_to_points']
+                frame_data['point_group_ids'] = group_out['point_group_ids']
+                frame_data['track_ids'] = group_out['point_group_ids']
+                frame_data['centers'] = build_center_lookup(group_out['group_ids'], group_out['group_centers'])
+                frame_data['display_tracks'] = compute_display_tracks(track_processor.group_tracker)
+                frame_data['raw_tracks'] = compute_raw_tracks(track_processor.group_tracker)
+                frame_data['relations'] = infer_frame_relations(prev_frame_state, frame_data, t)
+                all_relation_events.extend(relation for relation in frame_data['relations'] if relation['type'] in {'merge', 'split'})
+                prev_frame_state = frame_data
                 viz_frames.append(frame_data)
                 print(f'Frame {t:02d} | Active Tracks: 0')
                 continue
@@ -860,47 +870,21 @@ def run_inference_and_viz():
             corrected_pos = raw_pos + group_offsets.detach().cpu().numpy()
             frame_data['plot_pos'] = corrected_pos
 
-            det_centers, det_shapes, cluster_indices_list = build_gnn_detections(raw_pos, corrected_pos)
+            group_out = track_processor.update_group_tracks(corrected_pos)
+            frame_data['group_ids'] = group_out['group_ids']
+            frame_data['group_centers'] = group_out['group_centers']
+            frame_data['detected_centers'] = group_out['detected_centers']
+            frame_data['detected_shapes'] = group_out['detected_shapes']
+            frame_data['centroid_to_points'] = group_out['centroid_to_points']
+            frame_data['point_group_ids'] = group_out['point_group_ids']
+            frame_data['track_ids'] = group_out['point_group_ids']
+            frame_data['centers'] = build_center_lookup(group_out['group_ids'], group_out['group_centers'])
+            frame_data['display_tracks'] = compute_display_tracks(track_processor.group_tracker)
+            frame_data['raw_tracks'] = compute_raw_tracks(track_processor.group_tracker)
+            frame_data['relations'] = infer_frame_relations(prev_frame_state, frame_data, t)
 
-            if len(det_centers) > 0:
-                pred_centers, pred_track_ids, _ = gnn_processor.update(det_centers, det_shapes)
-            else:
-                pred_centers, pred_track_ids, _ = gnn_processor.update(np.empty((0, 2)), None)
-
-            pred_centers = np.array(pred_centers).reshape(-1, 2)
-            pred_track_ids = np.array(pred_track_ids).reshape(-1)
-
-            point_track_ids, centers, _ = assign_tracks_to_points(
-                pred_centers,
-                pred_track_ids,
-                det_centers,
-                cluster_indices_list,
-                num_nodes,
-            )
-
-            frame_data['track_ids'] = point_track_ids
-            frame_data['centers'] = centers
-
-            current_track_ids = set(gnn_processor.tracks.keys())
-            for track_id in current_track_ids:
-                lineage_meta.setdefault(track_id, {
-                    'root_id': track_id,
-                    'parents': tuple(),
-                    'generation': 0,
-                    'inherited_prefix': np.empty((0, 2), dtype=float),
-                })
-
-            frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
-            new_track_ids = sorted(current_track_ids - seen_track_ids)
-            lineage_events = create_lineage_events(new_track_ids, prev_track_ids, frame_data['display_tracks'], recent_history, t)
-            apply_lineage_events(lineage_meta, bridge_events, lineage_events)
-            frame_data['display_tracks'] = compute_display_tracks(gnn_processor, lineage_meta, bridge_events)
-            frame_data['raw_tracks'] = compute_raw_tracks(gnn_processor, lineage_meta)
-
-            seen_track_ids.update(current_track_ids)
-            update_recent_history(recent_history, frame_data['display_tracks'], t)
-            prev_track_ids = set(frame_data['display_tracks'].keys())
-
+            all_relation_events.extend(relation for relation in frame_data['relations'] if relation['type'] in {'merge', 'split'})
+            prev_frame_state = frame_data
             viz_frames.append(frame_data)
             print(f"Frame {t:02d} | Active Tracks: {len(frame_data['centers'])}")
 
@@ -943,8 +927,11 @@ def run_inference_and_viz():
             color = track_info['color']
             alpha_scale = 1.0 if track_info['age'] == 0 else VIZ_STYLE['ghost_alpha_scale']
             draw_fading_trail(ax, track_info['trace'], color, alpha_scale=alpha_scale)
-            for bridge in track_info.get('bridges', []):
-                draw_bridge(ax, bridge, color, frame_idx)
+
+        relation_start = max(0, frame_idx - VIZ_STYLE['relation_frames'] + 1)
+        for relation_frame_idx in range(relation_start, frame_idx + 1):
+            for relation in viz_frames[relation_frame_idx].get('relations', []):
+                draw_relation_event(ax, relation, current_frame_idx=frame_idx, overview=False)
 
         unique_ids = [uid for uid in np.unique(track_ids) if uid != -1]
         for uid in unique_ids:
@@ -1021,7 +1008,7 @@ def run_inference_and_viz():
                         ec=mcolors.to_rgba(color, 0.55),
                         lw=0.8,
                     ),
-                    zorder=8,
+                    zorder=12,
                 )
 
         info_text = (
@@ -1036,7 +1023,7 @@ def run_inference_and_viz():
             fontsize=VIZ_STYLE['info_fontsize'],
             color=VIZ_STYLE['text_color'],
             bbox=dict(boxstyle='round,pad=0.35', fc=mcolors.to_rgba('white', 0.80), ec='none'),
-            zorder=10,
+            zorder=13,
         )
 
         ax.set_xlim(*xlim)
@@ -1053,7 +1040,7 @@ def run_inference_and_viz():
     plt.close(fig)
     print(f'Saved {path2}')
 
-    overview_path = save_track_overview(viz_frames, xlim, ylim, labels)
+    overview_path = save_track_overview(viz_frames, xlim, ylim, labels, all_relation_events)
     if overview_path is not None:
         print(f'Saved {overview_path}')
 
