@@ -236,14 +236,15 @@ def infer_frame_relations(prev_frame, curr_frame, frame_idx):
     prev_group_centers = np.asarray(prev_frame.get('group_centers', np.empty((0, 2))), dtype=float).reshape(-1, 2)
     prev_center_lookup = build_center_lookup(prev_group_ids, prev_group_centers)
 
-    prev_point_group_ids = assign_track_ids_to_points(
-        prev_group_centers,
-        prev_group_ids,
-        curr_detected_centers,
-        curr_centroid_to_points,
-        curr_num_points,
-        GROUP_TO_CLUSTER_THRESH,
-    )
+    curr_points = curr_frame.get('plot_pos', np.empty((0, 2)))
+    prev_point_group_ids = np.full(curr_num_points, -1, dtype=int)
+    if len(prev_group_centers) > 0 and len(curr_points) > 0:
+        dists = np.linalg.norm(curr_points[:, None, :] - prev_group_centers[None, :, :], axis=-1)
+        min_idx = np.argmin(dists, axis=1)
+        min_dist = np.min(dists, axis=1)
+        valid = min_dist < max(GROUP_TO_CLUSTER_THRESH, 35.0)
+        prev_point_group_ids[valid] = prev_group_ids[min_idx[valid]]
+
     curr_frame['prev_point_group_ids'] = prev_point_group_ids
 
     pair_counts = defaultdict(int)
@@ -750,36 +751,37 @@ def save_track_overview(viz_frames, xlim, ylim, labels, relation_events):
             parents = relation.get('parents', [])
             children = relation.get('children', [])
             
-            if rel_type == 'merge' and children:
+            p_centers = relation.get('parent_centers', [])
+            c_centers = relation.get('child_centers', [])
+            
+            if rel_type == 'merge' and children and p_centers and c_centers:
                 cid = children[0]
-                if cid in continuous_overview_tracks:
-                    c_pt = continuous_overview_tracks[cid]['trace'][0]
-                    for pid in parents:
-                        if pid in continuous_overview_tracks:
-                            p_pt = continuous_overview_tracks[pid]['trace'][-1]
-                            p_color = continuous_overview_tracks[pid]['color']
-                            ax.plot(
-                                [p_pt[0], c_pt[0]], [p_pt[1], c_pt[1]],
-                                color=mcolors.to_rgba(p_color, VIZ_STYLE['merge_link_alpha']),
-                                linestyle='--',
-                                linewidth=VIZ_STYLE['merge_link_width'],
-                                zorder=4.5
-                            )
-            elif rel_type == 'split' and parents:
+                c_pt = c_centers[0]
+                for i, pid in enumerate(parents):
+                    if pid in continuous_overview_tracks and i < len(p_centers):
+                        p_pt = p_centers[i]
+                        p_color = continuous_overview_tracks[pid]['color']
+                        ax.plot(
+                            [p_pt[0], c_pt[0]], [p_pt[1], c_pt[1]],
+                            color=mcolors.to_rgba(p_color, VIZ_STYLE['merge_link_alpha']),
+                            linestyle='--',
+                            linewidth=VIZ_STYLE['merge_link_width'],
+                            zorder=4.5
+                        )
+            elif rel_type == 'split' and parents and p_centers and c_centers:
                 pid = parents[0]
-                if pid in continuous_overview_tracks:
-                    p_pt = continuous_overview_tracks[pid]['trace'][-1]
-                    for cid in children:
-                        if cid in continuous_overview_tracks:
-                            c_pt = continuous_overview_tracks[cid]['trace'][0]
-                            c_color = continuous_overview_tracks[cid]['color']
-                            ax.plot(
-                                [p_pt[0], c_pt[0]], [p_pt[1], c_pt[1]],
-                                color=mcolors.to_rgba(c_color, VIZ_STYLE['merge_link_alpha']),
-                                linestyle='--',
-                                linewidth=VIZ_STYLE['merge_link_width'],
-                                zorder=4.5
-                            )
+                p_pt = p_centers[0]
+                for i, cid in enumerate(children):
+                    if cid in continuous_overview_tracks and i < len(c_centers):
+                        c_pt = c_centers[i]
+                        c_color = continuous_overview_tracks[cid]['color']
+                        ax.plot(
+                            [p_pt[0], c_pt[0]], [p_pt[1], c_pt[1]],
+                            color=mcolors.to_rgba(c_color, VIZ_STYLE['merge_link_alpha']),
+                            linestyle='--',
+                            linewidth=VIZ_STYLE['merge_link_width'],
+                            zorder=4.5
+                        )
 
         draw_relation_event(ax, relation, overview=True)
 
