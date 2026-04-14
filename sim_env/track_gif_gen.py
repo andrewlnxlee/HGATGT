@@ -450,6 +450,147 @@ def draw_bridge(ax, bridge, color, frame_idx):
     )
 
 
+def collect_overview_tracks(viz_frames):
+    overview_tracks = {}
+    overview_bridges = {}
+
+    for data in viz_frames:
+        for track_id, track_info in data.get('display_tracks', {}).items():
+            trace = np.asarray(track_info.get('trace', []), dtype=float)
+            if not trace.size:
+                continue
+            existing = overview_tracks.get(track_id)
+            if existing is None or len(trace) >= len(existing['trace']):
+                overview_tracks[track_id] = {
+                    'trace': trace.copy(),
+                    'color': track_info['color'],
+                    'root_id': track_info['root_id'],
+                }
+
+            for bridge in track_info.get('bridges', []):
+                key = (
+                    bridge['start_frame'],
+                    tuple(np.round(bridge['start'], 4)),
+                    tuple(np.round(bridge['end'], 4)),
+                    bridge['type'],
+                )
+                overview_bridges[key] = {
+                    'start': np.asarray(bridge['start'], dtype=float),
+                    'end': np.asarray(bridge['end'], dtype=float),
+                    'type': bridge['type'],
+                    'child_id': track_id,
+                }
+
+    return overview_tracks, list(overview_bridges.values())
+
+
+def save_track_overview(viz_frames, xlim, ylim, labels):
+    overview_tracks, overview_bridges = collect_overview_tracks(viz_frames)
+    if not overview_tracks:
+        return None
+
+    fig, ax = plt.subplots(figsize=VIZ_STYLE['figsize'], dpi=VIZ_STYLE['dpi'])
+    fig.patch.set_facecolor(VIZ_STYLE['background'])
+    fig.subplots_adjust(left=0.11, right=0.97, bottom=0.10, top=0.92)
+    style_axes(ax)
+
+    for bridge in overview_bridges:
+        child_track = overview_tracks.get(bridge['child_id'])
+        color = child_track['color'] if child_track is not None else get_track_color(bridge['child_id'])
+        ax.plot(
+            [bridge['start'][0], bridge['end'][0]],
+            [bridge['start'][1], bridge['end'][1]],
+            color=mcolors.to_rgba(color, VIZ_STYLE['bridge_alpha'] * 0.85),
+            linewidth=VIZ_STYLE['bridge_width'],
+            linestyle='--',
+            solid_capstyle='round',
+            zorder=1,
+        )
+
+    for track_id in sorted(overview_tracks):
+        track_info = overview_tracks[track_id]
+        trace = track_info['trace']
+        color = track_info['color']
+        ax.plot(
+            trace[:, 0], trace[:, 1],
+            color=mcolors.to_rgba(color, 0.34),
+            linewidth=1.6,
+            solid_capstyle='round',
+            zorder=2,
+        )
+        ax.scatter(
+            trace[:, 0], trace[:, 1],
+            color=mcolors.to_rgba(color, 0.52),
+            s=10,
+            edgecolors='none',
+            zorder=3,
+        )
+        ax.scatter(
+            trace[0, 0], trace[0, 1],
+            color=mcolors.to_rgba(color, 0.78),
+            s=28,
+            marker='o',
+            edgecolors='white',
+            linewidths=0.7,
+            zorder=4,
+        )
+        ax.scatter(
+            trace[-1, 0], trace[-1, 1],
+            color=color,
+            s=40,
+            marker='X',
+            edgecolors='white',
+            linewidths=0.7,
+            zorder=5,
+        )
+        ax.annotate(
+            f'G{int(track_id)}',
+            xy=(trace[-1, 0], trace[-1, 1]),
+            xytext=(8, 6),
+            textcoords='offset points',
+            color=color,
+            fontsize=VIZ_STYLE['label_fontsize'],
+            fontweight='semibold',
+            ha='left',
+            va='bottom',
+            bbox=dict(
+                boxstyle='round,pad=0.25',
+                fc=mcolors.to_rgba('white', 0.88),
+                ec=mcolors.to_rgba(color, 0.55),
+                lw=0.8,
+            ),
+            zorder=6,
+        )
+
+    info_text = (
+        f'{labels["frame"]}: 00-{len(viz_frames) - 1:02d}\n'
+        f'{labels["active_groups"]}: {len(overview_tracks)}'
+    )
+    ax.text(
+        0.02, 0.98, info_text,
+        transform=ax.transAxes,
+        ha='left',
+        va='top',
+        fontsize=VIZ_STYLE['info_fontsize'],
+        color=VIZ_STYLE['text_color'],
+        bbox=dict(boxstyle='round,pad=0.35', fc=mcolors.to_rgba('white', 0.80), ec='none'),
+        zorder=10,
+    )
+
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_title(f"{labels['title']} - {'全时段轨迹总览' if labels['frame'] == '帧号' else 'Full Trajectory Overview'}", fontsize=14, color=VIZ_STYLE['title_color'], pad=12, fontweight='semibold')
+    ax.set_xlabel(labels['xlabel'], fontsize=10, color=VIZ_STYLE['tick_color'])
+    ax.set_ylabel(labels['ylabel'], fontsize=10, color=VIZ_STYLE['tick_color'])
+
+    os.makedirs(config.OUTPUT_GIF_DIR, exist_ok=True)
+    overview_path = os.path.join(config.OUTPUT_GIF_DIR, f'sim_data_{NUM}_track_overview_paper.png')
+    fig.savefig(overview_path, dpi=VIZ_STYLE['dpi'], bbox_inches='tight', facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return overview_path
+
+
 def build_gnn_detections(raw_pos, corrected_pos):
     if len(corrected_pos) == 0:
         return np.empty((0, 2)), None, []
@@ -780,6 +921,10 @@ def run_inference_and_viz():
     ani.save(path2, writer='pillow', fps=VIZ_STYLE['fps'], dpi=VIZ_STYLE['dpi'])
     plt.close(fig)
     print(f'Saved {path2}')
+
+    overview_path = save_track_overview(viz_frames, xlim, ylim, labels)
+    if overview_path is not None:
+        print(f'Saved {overview_path}')
 
 
 if __name__ == '__main__':
