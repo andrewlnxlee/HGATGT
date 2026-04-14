@@ -68,6 +68,8 @@ VIZ_STYLE = {
     'merge_arrow_width': 3.2,
     'merge_arrow_head_scale': 24,
     'merge_arrow_outline_width': 5.0,
+    'merge_detect_thresh': 72.0,
+    'merge_arrow_color': '#D84B3A',
     'centroid_outer_size': 132,
     'centroid_inner_size': 58,
     'label_fontsize': 9,
@@ -459,8 +461,16 @@ def draw_bridge(ax, bridge, color, frame_idx):
 def collect_overview_tracks(viz_frames):
     overview_tracks = {}
     overview_bridges = {}
+    persistent_merges = {}
 
-    for data in viz_frames:
+    prev_centers = {}
+    prev_ids = set()
+    prev_frame_idx = None
+
+    for frame_idx, data in enumerate(viz_frames):
+        current_centers = {int(tid): np.asarray(center, dtype=float) for tid, center in data.get('centers', {}).items()}
+        current_ids = set(current_centers.keys())
+
         for track_id, track_info in data.get('display_tracks', {}).items():
             trace = np.asarray(track_info.get('trace', []), dtype=float)
             if not trace.size:
@@ -488,6 +498,38 @@ def collect_overview_tracks(viz_frames):
                     'start_frame': bridge['start_frame'],
                 }
 
+        if prev_frame_idx is not None:
+            vanished_ids = prev_ids - current_ids
+            survived_ids = prev_ids & current_ids
+            for vanished_id in vanished_ids:
+                vanish_center = prev_centers[vanished_id]
+                candidates = []
+                for survive_id in survived_ids:
+                    survive_center = current_centers[survive_id]
+                    distance = float(np.linalg.norm(survive_center - vanish_center))
+                    if distance <= VIZ_STYLE['merge_detect_thresh']:
+                        candidates.append((distance, survive_id, survive_center))
+                if candidates:
+                    candidates.sort(key=lambda item: item[0])
+                    _, child_id, child_center = candidates[0]
+                    key = (prev_frame_idx, vanished_id, child_id)
+                    persistent_merges[key] = {
+                        'start': vanish_center.copy(),
+                        'end': child_center.copy(),
+                        'type': 'merge_persistent',
+                        'child_id': child_id,
+                        'start_frame': prev_frame_idx,
+                        'source_id': vanished_id,
+                    }
+
+        prev_centers = current_centers
+        prev_ids = current_ids
+        prev_frame_idx = frame_idx
+
+    overview_bridges.update({
+        ('persistent', item['start_frame'], item['source_id'], item['child_id']): item
+        for item in persistent_merges.values()
+    })
     return overview_tracks, list(overview_bridges.values())
 
 
@@ -561,8 +603,9 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
     for bridge in overview_bridges:
         child_track = overview_tracks.get(bridge['child_id'])
         color = child_track['color'] if child_track is not None else get_track_color(bridge['child_id'])
-        bridge_alpha = VIZ_STYLE['bridge_alpha'] * (0.95 if bridge['type'] == 'merge' else 0.80)
-        if bridge['type'] == 'merge':
+        is_merge_bridge = bridge['type'] in {'merge', 'merge_persistent'}
+        bridge_alpha = VIZ_STYLE['bridge_alpha'] * (0.95 if is_merge_bridge else 0.80)
+        if is_merge_bridge:
             ax.annotate(
                 '',
                 xy=(bridge['end'][0], bridge['end'][1]),
@@ -583,7 +626,7 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
                 xytext=(bridge['start'][0], bridge['start'][1]),
                 arrowprops=dict(
                     arrowstyle='-|>',
-                    color=mcolors.to_rgba(color, bridge_alpha),
+                    color=mcolors.to_rgba(VIZ_STYLE['merge_arrow_color'], bridge_alpha),
                     lw=VIZ_STYLE['merge_arrow_width'],
                     shrinkA=0,
                     shrinkB=0,
@@ -594,7 +637,7 @@ def save_track_overview(viz_frames, xlim, ylim, labels):
             key = tuple(np.round(bridge['end'], 4))
             merge_endpoints.setdefault(key, {
                 'point': np.asarray(bridge['end'], dtype=float),
-                'color': color,
+                'color': VIZ_STYLE['merge_arrow_color'],
                 'count': 0,
             })
             merge_endpoints[key]['count'] += 1
