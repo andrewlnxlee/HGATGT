@@ -19,7 +19,7 @@ import config
 from model import GNNGroupTracker
 from dataset import RadarFileDataset
 from trackers.gnn_processor import GNNPostProcessor
-from trackers.gnn_processor_all import build_group_detections
+from trackers.gnn_processor_all import GROUP_TO_CLUSTER_THRESH, build_group_detections
 
 
 NUM = 20  # 选择第几个样本 episode
