@@ -216,14 +216,27 @@ def visualize_on_video():
                 hist_key = f"{tid}_{i}"
                 if hist_key not in history: history[hist_key] = []
                 history[hist_key].append((u, v))
-                pts = np.array(history[hist_key][-25:], dtype=np.int32)
-                for j in range(len(pts)-1):
-                    alpha = (j + 1) / len(pts)
-                    thickness = int(1 + alpha * 3)
-                    cv2.line(frame, tuple(pts[j]), tuple(pts[j+1]), colors[tid], thickness, lineType=cv2.LINE_AA)
-                cv2.circle(frame, (u, v), 5, colors[tid], -1, lineType=cv2.LINE_AA)
+                pts = np.array(history[hist_key][-25:], dtype=np.float32)
                 if len(pts) >= 2:
-                    cv2.arrowedLine(frame, tuple(pts[-2]), tuple(pts[-1]), colors[tid], 2, tipLength=0.8, line_type=cv2.LINE_AA)
+                    diffs = pts[1:] - pts[:-1]
+                    tangents = np.zeros_like(pts)
+                    tangents[0] = diffs[0]
+                    tangents[-1] = diffs[-1]
+                    if len(pts) > 2:
+                        tangents[1:-1] = (diffs[:-1] + diffs[1:]) / 2.0
+                    norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+                    norms[norms < 1e-5] = 1e-5
+                    tangents = tangents / norms
+                    normals = np.empty_like(tangents)
+                    normals[:, 0] = -tangents[:, 1]
+                    normals[:, 1] = tangents[:, 0]
+                    alphas = np.linspace(0.1, 1.0, len(pts)).reshape(-1, 1)
+                    radii = 0.5 + alphas * 2.0
+                    left_pts = pts + normals * radii
+                    right_pts = pts - normals * radii
+                    ribbon = np.vstack((left_pts, right_pts[::-1])).astype(np.int32)
+                    cv2.fillPoly(frame, [ribbon], colors[tid], lineType=cv2.LINE_AA)
+                cv2.circle(frame, (u, v), 5, colors[tid], -1, lineType=cv2.LINE_AA)
                 cv2.putText(frame, str(tid), (u+5, v-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
             else:
                 cv2.circle(frame, (u, v), 2, (150, 150, 150), -1, lineType=cv2.LINE_AA)

@@ -316,14 +316,27 @@ def visualize_hotel_on_video():
                 if tid is not None:
                     hist_key = f'{int(tid)}_{int(idx)}'
                     history[hist_key].append((int(pt[0]), int(pt[1])))
-                    pts_hist = np.array(history[hist_key][-TRAIL_LENGTH:], dtype=np.int32)
-                    for j in range(len(pts_hist) - 1):
-                        alpha = (j + 1) / len(pts_hist)
-                        thickness = int(1 + alpha * 3)
-                        cv2.line(frame, tuple(pts_hist[j]), tuple(pts_hist[j + 1]), colors[tid], thickness, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, tuple(pt), 5, colors[tid], -1, lineType=cv2.LINE_AA)
+                    pts_hist = np.array(history[hist_key][-TRAIL_LENGTH:], dtype=np.float32)
                     if len(pts_hist) >= 2:
-                        cv2.arrowedLine(frame, tuple(pts_hist[-2]), tuple(pts_hist[-1]), colors[tid], 2, tipLength=0.8, line_type=cv2.LINE_AA)
+                        diffs = pts_hist[1:] - pts_hist[:-1]
+                        tangents = np.zeros_like(pts_hist)
+                        tangents[0] = diffs[0]
+                        tangents[-1] = diffs[-1]
+                        if len(pts_hist) > 2:
+                            tangents[1:-1] = (diffs[:-1] + diffs[1:]) / 2.0
+                        norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+                        norms[norms < 1e-5] = 1e-5
+                        tangents = tangents / norms
+                        normals = np.empty_like(tangents)
+                        normals[:, 0] = -tangents[:, 1]
+                        normals[:, 1] = tangents[:, 0]
+                        alphas = np.linspace(0.1, 1.0, len(pts_hist)).reshape(-1, 1)
+                        radii = 0.5 + alphas * 2.0
+                        left_pts = pts_hist + normals * radii
+                        right_pts = pts_hist - normals * radii
+                        ribbon = np.vstack((left_pts, right_pts[::-1])).astype(np.int32)
+                        cv2.fillPoly(frame, [ribbon], colors[tid], lineType=cv2.LINE_AA)
+                    cv2.circle(frame, tuple(pt), 5, colors[tid], -1, lineType=cv2.LINE_AA)
                     cv2.putText(frame, str(int(tid)), (int(pt[0]) + 5, int(pt[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
                 else:
                     cv2.circle(frame, tuple(pt), 2, (150, 150, 150), -1, lineType=cv2.LINE_AA)
