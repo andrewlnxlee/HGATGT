@@ -219,9 +219,9 @@ def visualize_on_video():
                 pts = np.array(history[hist_key][-25:], dtype=np.int32)
                 for j in range(len(pts)-1):
                     alpha = (j + 1) / len(pts)
-                    blend_color = [int(bc * alpha + 100 * (1 - alpha)) for bc in colors[tid]]
-                    cv2.line(frame, tuple(pts[j]), tuple(pts[j+1]), blend_color, 1, lineType=cv2.LINE_AA)
-                cv2.circle(frame, (u, v), 3, colors[tid], -1, lineType=cv2.LINE_AA)
+                    thickness = int(1 + alpha * 3)
+                    cv2.arrowedLine(frame, tuple(pts[j]), tuple(pts[j+1]), colors[tid], thickness, tipLength=0.3, line_type=cv2.LINE_AA)
+                cv2.circle(frame, (u, v), 5, colors[tid], -1, lineType=cv2.LINE_AA)
                 cv2.putText(frame, str(tid), (u+5, v-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
             else:
                 cv2.circle(frame, (u, v), 2, (150, 150, 150), -1, lineType=cv2.LINE_AA)

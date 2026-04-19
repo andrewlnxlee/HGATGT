@@ -319,9 +319,9 @@ def visualize_hotel_on_video():
                     pts_hist = np.array(history[hist_key][-TRAIL_LENGTH:], dtype=np.int32)
                     for j in range(len(pts_hist) - 1):
                         alpha = (j + 1) / len(pts_hist)
-                        trail_color = [int(c * alpha + 100 * (1 - alpha)) for c in colors[tid]]
-                        cv2.line(frame, tuple(pts_hist[j]), tuple(pts_hist[j + 1]), trail_color, 1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, tuple(pt), 3, colors[tid], -1, lineType=cv2.LINE_AA)
+                        thickness = int(1 + alpha * 3)
+                        cv2.arrowedLine(frame, tuple(pts_hist[j]), tuple(pts_hist[j + 1]), colors[tid], thickness, tipLength=0.3, line_type=cv2.LINE_AA)
+                    cv2.circle(frame, tuple(pt), 5, colors[tid], -1, lineType=cv2.LINE_AA)
                     cv2.putText(frame, str(int(tid)), (int(pt[0]) + 5, int(pt[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
                 else:
                     cv2.circle(frame, tuple(pt), 2, (150, 150, 150), -1, lineType=cv2.LINE_AA)
