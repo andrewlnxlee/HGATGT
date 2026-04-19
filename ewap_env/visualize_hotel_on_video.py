@@ -320,8 +320,10 @@ def visualize_hotel_on_video():
                     for j in range(len(pts_hist) - 1):
                         alpha = (j + 1) / len(pts_hist)
                         thickness = int(1 + alpha * 3)
-                        cv2.arrowedLine(frame, tuple(pts_hist[j]), tuple(pts_hist[j + 1]), colors[tid], thickness, tipLength=0.3, line_type=cv2.LINE_AA)
+                        cv2.line(frame, tuple(pts_hist[j]), tuple(pts_hist[j + 1]), colors[tid], thickness, lineType=cv2.LINE_AA)
                     cv2.circle(frame, tuple(pt), 5, colors[tid], -1, lineType=cv2.LINE_AA)
+                    if len(pts_hist) >= 2:
+                        cv2.arrowedLine(frame, tuple(pts_hist[-2]), tuple(pts_hist[-1]), colors[tid], 2, tipLength=0.8, line_type=cv2.LINE_AA)
                     cv2.putText(frame, str(int(tid)), (int(pt[0]) + 5, int(pt[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
                 else:
                     cv2.circle(frame, tuple(pt), 2, (150, 150, 150), -1, lineType=cv2.LINE_AA)

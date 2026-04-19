@@ -220,8 +220,10 @@ def visualize_on_video():
                 for j in range(len(pts)-1):
                     alpha = (j + 1) / len(pts)
                     thickness = int(1 + alpha * 3)
-                    cv2.arrowedLine(frame, tuple(pts[j]), tuple(pts[j+1]), colors[tid], thickness, tipLength=0.3, line_type=cv2.LINE_AA)
+                    cv2.line(frame, tuple(pts[j]), tuple(pts[j+1]), colors[tid], thickness, lineType=cv2.LINE_AA)
                 cv2.circle(frame, (u, v), 5, colors[tid], -1, lineType=cv2.LINE_AA)
+                if len(pts) >= 2:
+                    cv2.arrowedLine(frame, tuple(pts[-2]), tuple(pts[-1]), colors[tid], 2, tipLength=0.8, line_type=cv2.LINE_AA)
                 cv2.putText(frame, str(tid), (u+5, v-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
             else:
                 cv2.circle(frame, (u, v), 2, (150, 150, 150), -1, lineType=cv2.LINE_AA)
