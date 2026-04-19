@@ -230,8 +230,9 @@ def visualize_on_video():
                     normals = np.empty_like(tangents)
                     normals[:, 0] = -tangents[:, 1]
                     normals[:, 1] = tangents[:, 0]
-                    alphas = np.linspace(0.1, 1.0, len(pts)).reshape(-1, 1)
-                    radii = 0.5 + alphas * 2.0
+                    alphas = np.linspace(0.0, 1.0, len(pts)).reshape(-1, 1)
+                    # 使用非线性增长(1.5次方)让彗星尾巴更漂亮，半径最终放大到5.0，完美衔接头部的圆点
+                    radii = (alphas ** 1.5) * 5.0
                     left_pts = pts + normals * radii
                     right_pts = pts - normals * radii
                     ribbon = np.vstack((left_pts, right_pts[::-1])).astype(np.int32)
